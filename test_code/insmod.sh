@@ -9,7 +9,7 @@ GC_MODE=${1:-0}
 
 # 설정 변수 (필요하면 여기서 수정하세요)
 MEM_START="4G"
-MEM_SIZE="512M"
+MEM_SIZE="1024M"
 CPUS="1,2"
 
 # [추가] 디버그 모드 설정 (1=On, 0=Off)

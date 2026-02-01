@@ -14,6 +14,15 @@ static int gc_mode = 0; // 0:Greedy, 1:CB, 2:Random
 static int debug_mode = 0;    // debug mode == 1;
 module_param(gc_mode, int, 0644); // insmod 할 때 gc_mode=2 처럼 입력 가능
 module_param(debug_mode, int, 0644);
+/* ========================================================= */
+/* [Meen's Debug] Hot/Cold GC 카운터 및 기준 설정 */
+/* 150MB 지점 LPN = 38400 (FIO 스크립트 기준) */
+#define HOT_REGION_LPN_LIMIT  38400
+
+static unsigned long total_gc_cnt = 0; // 총 GC 횟수
+static unsigned long hot_gc_cnt = 0;   // Hot 블록이 잡힌 횟수
+static unsigned long cold_gc_cnt = 0;  // Cold 블록이 잡힌 횟수
+/* ========================================================= */
 
 // 현재 페이지가 워드라인(Wordline)의 마지막 페이지인지 확인하는 함수
 static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *ppa)
@@ -775,6 +784,9 @@ static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
     line = get_line(conv_ftl, ppa); // 라인 가져오기
     NVMEV_ASSERT(line->vpc >= 0 && line->vpc < spp->pgs_per_line);
     line->vpc++; // 라인 유효 페이지 수 증가
+    if (gc_mode == GC_MODE_COST_BENEFIT) {
+       line->last_modified_time = ktime_get_ns();  
+    }
 }
 
 // 블록을 프리(Free) 상태로 초기화하는 함수 (Erase 수행 시)
@@ -835,7 +847,6 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
     set_rmap_ent(conv_ftl, lpn, &new_ppa); // 역매핑 테이블 갱신
 
     mark_page_valid(conv_ftl, &new_ppa); // 새 페이지를 유효 상태로 마킹
-
     /* GC로 복사된 페이지 수 증가 */
     conv_ftl->gc_copied_pages++;
 
@@ -957,7 +968,60 @@ static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
     list_add_tail(&line->entry, &lm->free_line_list); // 프리 라인 리스트 끝에 추가
     lm->free_line_cnt++; // 프리 라인 수 증가
 }
+static void count_gc_victim_type(struct conv_ftl *conv_ftl, struct line *victim)
+{
+    u64 check_lpn = INVALID_LPN;
+    struct ppa ppa;
+    struct ssdparams *spp = &conv_ftl->ssd->sp;
+    int i;
 
+    // [1] Full Garbage (유효 페이지 0개) 처리
+    // 유효 페이지가 하나도 없다는 건, 쓰자마자 지워진 "초(Ultra) Hot" 데이터일 확률이 높습니다.
+    // 카피할 게 없어서 GC가 제일 좋아하는 상황입니다. 이것도 Hot으로 쳐줍니다.
+    if (victim->vpc == 0) {
+        hot_gc_cnt++;
+        total_gc_cnt++;
+        return;
+    }
+
+    // [2] PPA 구조체 세팅 (탐색용)
+    // Line ID가 곧 Block ID입니다.
+    ppa.g.ch = 0;   // 첫 번째 채널
+    ppa.g.lun = 0;  // 첫 번째 LUN
+    ppa.g.pl = 0;   // 첫 번째 플레인
+    ppa.g.blk = victim->id; // ★ 핵심: 희생양의 블록 ID
+    
+    // [3] 블록 내 페이지를 뒤져서 LPN 찾기
+    // (보통 Hot/Cold는 스트라이핑되어 저장되므로, 0번 채널/0번 LUN만 봐도 충분합니다)
+    for (i = 0; i < spp->pgs_per_blk; i++) {
+        ppa.g.pg = i;
+
+        // ★ 기존에 있는 함수 활용 (가장 안전함)
+        check_lpn = get_rmap_ent(conv_ftl, &ppa);
+
+        // 유효한 LPN을 찾았다면 스톱!
+        if (check_lpn != INVALID_LPN) {
+             break; 
+        }
+    }
+
+    // [4] 예외 처리: 유효 페이지가 있다고 했는데(vpc > 0) 못 찾은 경우
+    if (check_lpn == INVALID_LPN) {
+        // 이 경우는 다른 채널/LUN에 유효 페이지가 숨어있는 경우입니다.
+        // 하지만 통계적으로 무시해도 될 수준이거나, Hot/Cold 데이터는 
+        // 보통 모든 채널에 걸쳐 쓰이므로 여기서 못 찾을 확률은 매우 낮습니다.
+        return; 
+    }
+
+    total_gc_cnt++;
+
+    // [5] 판별 로직
+    if (check_lpn < HOT_REGION_LPN_LIMIT) {
+        hot_gc_cnt++; // 🔥 Hot 영역
+    } else {
+        cold_gc_cnt++; // 🧊 Cold 영역
+    }
+}
 // 실제 GC를 수행하는 메인 함수
 static int do_gc(struct conv_ftl *conv_ftl, bool force)
 {
@@ -971,8 +1035,10 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
     if (!victim_line) {
         return -1; // 선택 실패 시 리턴
     }
+    if(debug_mode){
+        count_gc_victim_type(conv_ftl, victim_line);
+    }
     conv_ftl->gc_count++;
-
     ppa.g.blk = victim_line->id;
     ppa.g.blk = victim_line->id; // 선택된 라인 ID를 블록 주소로 설정
     // GC 정보 디버그 출력
@@ -1203,9 +1269,6 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
         if (mapped_ppa(&ppa)) {
             /* update old page information first */
             mark_page_invalid(conv_ftl, &ppa); // 기존 페이지 무효화
-            if (gc_mode == GC_MODE_COST_BENEFIT) {
-                get_line(conv_ftl, &ppa)->last_modified_time = ktime_get_ns();  
-            }
             set_rmap_ent(conv_ftl, INVALID_LPN, &ppa); // 역매핑 삭제
             NVMEV_DEBUG("%s: %lld is invalid, ", __func__, ppa2pgidx(conv_ftl, &ppa));
         }
@@ -1217,9 +1280,9 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
         NVMEV_DEBUG("%s: got new ppa %lld, ", __func__, ppa2pgidx(conv_ftl, &ppa));
         /* update rmap */
         set_rmap_ent(conv_ftl, local_lpn, &ppa); // 역매핑 테이블 갱신
-
+        
         mark_page_valid(conv_ftl, &ppa); // 새 페이지 유효화
-       
+   
         /* need to advance the write pointer here */
         advance_write_pointer(conv_ftl, USER_IO); // 쓰기 포인터 전진
 
@@ -1279,6 +1342,15 @@ static void conv_flush(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		printk(KERN_INFO "NVMeVirt:  Total Copied Pages: %llu\n", total_copied);
 		printk(KERN_INFO "NVMeVirt:  Avg Pages per GC: %llu\n", 
 		       total_gc > 0 ? total_copied / total_gc : 0);
+        if (total_gc_cnt > 0) {
+            printk(KERN_INFO "NVMeVirt: [Hot/Cold Analysis]\n");
+            printk(KERN_INFO "NVMeVirt:  Total Sampled GC: %lu\n", total_gc_cnt);
+            printk(KERN_INFO "NVMeVirt:  🔥 Hot Victims : %lu\n", hot_gc_cnt);
+            printk(KERN_INFO "NVMeVirt:  🧊 Cold Victims: %lu\n", cold_gc_cnt);
+            printk(KERN_INFO "NVMeVirt:  🧊 Cold Ratio  : %lu%%\n", (cold_gc_cnt * 100) / total_gc_cnt);
+        } else {
+            printk(KERN_INFO "NVMeVirt: [Hot/Cold Analysis] No GC triggered yet.\n");
+        }
 	}
     ret->status = NVME_SC_SUCCESS;
     ret->nsecs_target = latest; // 완료 목표 시간 설정
