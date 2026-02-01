@@ -1,32 +1,81 @@
+# -------------------------------------------------------------------------
+# 변수 설정 (Variables)
+# -------------------------------------------------------------------------
+
+# 현재 실행 중인 리눅스 커널의 빌드 디렉토리 경로를 설정합니다.
+# $(shell uname -r)은 현재 커널 버전(예: 5.4.0-generic)을 가져옵니다.
+# /lib/modules/<커널버전>/build는 보통 커널 헤더 파일이 있는 곳으로 심볼릭 링크되어 있습니다.
 KERNELDIR := /lib/modules/$(shell uname -r)/build
+
+# 현재 작업 디렉토리(Makefile이 있는 위치)의 경로를 저장합니다.
+# 커널 빌드 시스템에게 "소스 코드는 여기에 있어"라고 알려줄 때 사용합니다.
 PWD       := $(shell pwd)
+
+# 모듈이 설치될 경로를 지정합니다. 
+# 비어있으면(기본값) /lib/modules/<커널버전>/extra/ 등으로 설치됩니다.
 INSTALL_MOD_PATH :=
 
+# -------------------------------------------------------------------------
+# 외부 설정 포함 (Include)
+# -------------------------------------------------------------------------
+
+# 로컬 설정 파일을 포함합니다.
+# ★중요★: 아까 보셨던 SSD 모델 설정(BASE_SSD=1 등)이 보통 여기에 들어있습니다.
+# 만약 Makefile.local 파일이 없다면 에러가 날 수 있습니다.
 include Makefile.local
 
-default:
-		$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
+# -------------------------------------------------------------------------
+# 빌드 타겟 (Targets)
+# -------------------------------------------------------------------------
 
+# 'make'라고만 쳤을 때 실행되는 기본 타겟입니다.
+default:
+# $(MAKE): make 명령어를 실행합니다.
+# -C $(KERNELDIR): 커널 빌드 디렉토리로 이동합니다. (거기 있는 Makefile을 쓰기 위해)
+# M=$(PWD): "외부 모듈 소스는 $(PWD)에 있다"고 알려줍니다.
+# modules: 모듈을 컴파일하라는 명령어입니다.
+	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
+
+# 'make install'을 쳤을 때 실행됩니다.
+# 컴파일된 .ko 파일을 시스템 폴더로 복사하고, depmod를 갱신합니다.
 install:
-		$(MAKE) INSTALL_MOD_PATH="$(INSTALL_MOD_PATH)" -C $(KERNELDIR) modules_install
+	$(MAKE) INSTALL_MOD_PATH="$(INSTALL_MOD_PATH)" -C $(KERNELDIR) modules_install
+
+# -------------------------------------------------------------------------
+# 유틸리티 타겟 (Utilities)
+# .PHONY는 파일 이름과 타겟 이름이 겹칠 경우를 대비한 가짜 타겟 선언입니다.
+# -------------------------------------------------------------------------
 
 .PHONY: clean
 clean:
-	   $(MAKE) -C $(KERNELDIR) M=$(PWD) clean
-	   rm -f cscope.out tags nvmev.S
+# 빌드 과정에서 생성된 .o, .ko, .mod.c 등의 임시 파일들을 삭제합니다.
+	$(MAKE) -C $(KERNELDIR) M=$(PWD) clean
+# cscope 데이터베이스, 태그 파일, 역어셈블 파일 등 추가로 생성된 파일도 지웁니다.
+	rm -f cscope.out tags nvmev.S
 
 .PHONY: cscope
 cscope:
-		cscope -b -R
-		ctags *.[ch]
+# cscope: 코드 분석 도구입니다. 소스 코드를 인덱싱하여 DB를 만듭니다.
+# -b: DB만 빌드하고 cscope 창을 열지 않음
+# -R: 하위 디렉토리까지 재귀적으로 탐색
+	cscope -b -R
+# ctags: vi나 emacs에서 함수 정의로 점프하기 위한 태그 파일을 만듭니다.
+	ctags *.[ch]
 
 .PHONY: tags
 tags: cscope
+# 'make tags'라고 쳐도 cscope 타겟이 실행되도록 별칭(Alias)을 둡니다.
 
 .PHONY: format
 format:
+# clang-format 도구를 사용해 소스 코드(*.c, *.h)의 들여쓰기 등 스타일을 자동으로 정리합니다.
+# -i: 파일 내용을 직접 수정(In-place edit)합니다.
 	clang-format -i *.[ch]
 
 .PHONY: dis
 dis:
+# 디버깅용 타겟입니다. (Disassemble)
+# 빌드된 커널 모듈(nvmev.ko)을 역어셈블하여 사람이 읽을 수 있는 어셈블리 코드(nvmev.S)로 저장합니다.
+# -d: 역어셈블 수행
+# -S: 소스 코드와 어셈블리 코드를 섞어서 보여줌 (디버깅에 유용)
 	objdump -d -S nvmev.ko > nvmev.S

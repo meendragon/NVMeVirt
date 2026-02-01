@@ -61,22 +61,22 @@ enum {
 #define LBA_SIZE (1 << LBA_BITS)
 
 #elif (BASE_SSD == SAMSUNG_970PRO)
-#define NR_NAMESPACES 1
+#define NR_NAMESPACES 1	//논리적 분할 공간?
 
-#define NS_SSD_TYPE_0 SSD_TYPE_CONV
+#define NS_SSD_TYPE_0 SSD_TYPE_CONV	//일반적인(Conventional) SSD 타입
 #define NS_CAPACITY_0 (0)
 #define NS_SSD_TYPE_1 NS_SSD_TYPE_0
 #define NS_CAPACITY_1 (0)
-#define MDTS (6)
-#define CELL_MODE (CELL_MODE_MLC)
+#define MDTS (6)	//Maximum Data Transfer Size입니다. 호스트가 한 번에 전송할 수 있는 최대 크기를 제한하는 값입니다.
+#define CELL_MODE (CELL_MODE_MLC)	//이럴수가 MLC로 고정이되어 있습니다.
 
-#define SSD_PARTITIONS (4)
-#define NAND_CHANNELS (8)
-#define LUNS_PER_NAND_CH (2)
+#define SSD_PARTITIONS (4)	//SSD 내부를 크게 4개의 파티션으로 나눕니다.
+#define NAND_CHANNELS (4)	//컨트롤러와 낸드 플래시를 연결하는 채널이 4개입니다.
+#define LUNS_PER_NAND_CH (2)	//각 채널당 2개의 LUN(Die)이 연결되어 있습니다.
 #define PLNS_PER_LUN (1)
 #define FLASH_PAGE_SIZE KB(32)
 #define ONESHOT_PAGE_SIZE (FLASH_PAGE_SIZE * 1)
-#define BLKS_PER_PLN (8192)
+#define BLKS_PER_PLN (1024)
 #define BLK_SIZE (0) /*BLKS_PER_PLN should not be 0 */
 static_assert((ONESHOT_PAGE_SIZE % FLASH_PAGE_SIZE) == 0);
 
