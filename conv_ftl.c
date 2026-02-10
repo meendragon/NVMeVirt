@@ -24,7 +24,8 @@ static unsigned long total_gc_cnt = 0; // 총 GC 횟수
 static unsigned long hot_gc_cnt = 0;   // Hot 블록이 잡힌 횟수
 static unsigned long cold_gc_cnt = 0;  // Cold 블록이 잡힌 횟수
 /* ========================================================= */
-
+static uint64_t victim_total_age = 0;
+static uint64_t victim_chosen_cnt = 0;
 // 현재 페이지가 워드라인(Wordline)의 마지막 페이지인지 확인하는 함수
 static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
@@ -162,7 +163,8 @@ static struct line *select_victim_greedy(struct conv_ftl *conv_ftl, bool force)
     if (!force && (victim_line->vpc > (conv_ftl->ssd->sp.pgs_per_line / 8))) {
         return NULL;
     }
-
+    victim_total_age += (ktime_get_ns()-(victim_line->last_modified_time))/1000000;
+    victim_chosen_cnt++;
     pqueue_pop(lm->victim_line_pq); // 1등 꺼내기
     victim_line->pos = 0;
     lm->victim_line_cnt--;
@@ -260,7 +262,7 @@ static struct line *select_victim_cb(struct conv_ftl *conv_ftl, bool force)
     
     // 4. 현재까지 발견된 '최고 점수'를 저장할 변수 (초기값 0 또는 -1)
     uint64_t max_score = 0; 
-    
+    uint64_t victim_age = 0;
     // 5. 나이(Age) 계산을 위해 현재 커널 시간(나노초 단위)을 가져옴
     uint64_t now = ktime_get_ns();
     
@@ -286,7 +288,7 @@ static struct line *select_victim_cb(struct conv_ftl *conv_ftl, bool force)
         uint64_t age = (now > cand->last_modified_time) ? 
                        (now - cand->last_modified_time) : 0;
       
-        printk(KERN_INFO "Age: %llu\n", age);
+        
         uint64_t age_weight = get_age_weight(age);
         // 11. Cost-Benefit 점수 계산
         // - 공식: Benefit(Age * IPC) / Cost(2 * VPC)
@@ -297,6 +299,7 @@ static struct line *select_victim_cb(struct conv_ftl *conv_ftl, bool force)
         if (score > max_score) {
             // 13. 최고 점수 갱신
             max_score = score;
+            victim_age = age;
             // 14. 현재 블록을 '최고의 희생양' 후보로 등록
             best_victim = cand;
         }
@@ -306,6 +309,8 @@ static struct line *select_victim_cb(struct conv_ftl *conv_ftl, bool force)
     if (best_victim) {
         // 16. 우선순위 큐에서 해당 라인을 '안전하게' 제거
         // (pqueue_pop은 맨 위만 빼지만, remove는 중간에 있는 놈을 빼고 트리를 재정렬함)
+        victim_total_age += victim_age / 1000000;
+        victim_chosen_cnt++;
         pqueue_remove(q, best_victim); 
         // 17. 해당 라인의 큐 위치 정보 초기화 (큐에서 빠졌음을 표시)
         best_victim->pos = 0;
@@ -781,7 +786,7 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
     pg = get_pg(conv_ftl->ssd, ppa); // 페이지 가져오기
     NVMEV_ASSERT(pg->status == PG_VALID); // 유효 상태였는지 확인
     pg->status = PG_INVALID; // 무효 상태로 변경
-
+    
     /* update corresponding block status */
     blk = get_blk(conv_ftl->ssd, ppa); // 블록 가져오기
     NVMEV_ASSERT(blk->ipc >= 0 && blk->ipc < spp->pgs_per_blk);
@@ -813,6 +818,7 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
         pqueue_insert(lm->victim_line_pq, line); // Victim 우선순위 큐로 이동
         lm->victim_line_cnt++; // Victim 라인 수 증가
     }
+    line->last_modified_time = ktime_get_ns(); 
 }
 
 // 페이지를 유효화(Valid) 처리하는 함수 (새 데이터 쓰기 시)
@@ -837,9 +843,6 @@ static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
     line = get_line(conv_ftl, ppa); // 라인 가져오기
     NVMEV_ASSERT(line->vpc >= 0 && line->vpc < spp->pgs_per_line);
     line->vpc++; // 라인 유효 페이지 수 증가
-    if (gc_mode == GC_MODE_COST_BENEFIT) {
-       line->last_modified_time = ktime_get_ns();  
-    }
 }
 
 // 블록을 프리(Free) 상태로 초기화하는 함수 (Erase 수행 시)
@@ -1401,6 +1404,7 @@ static void conv_flush(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
             printk(KERN_INFO "NVMeVirt:  🔥 Hot Victims : %lu\n", hot_gc_cnt);
             printk(KERN_INFO "NVMeVirt:  🧊 Cold Victims: %lu\n", cold_gc_cnt);
             printk(KERN_INFO "NVMeVirt:  🧊 Cold Ratio  : %lu%%\n", (cold_gc_cnt * 100) / total_gc_cnt);
+            printk(KERN_INFO "NVMeVirt:  Average Age  : %lu%%\n", victim_total_age / victim_chosen_cnt);
         } else {
             printk(KERN_INFO "NVMeVirt: [Hot/Cold Analysis] No GC triggered yet.\n");
         }
