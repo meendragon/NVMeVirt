@@ -194,37 +194,52 @@ static struct line *select_victim_random(struct conv_ftl *conv_ftl, bool force)
 }
 
 
-// 논문 기반 임계값 설정 (예시: 초 단위 -> 나노초 변환)
-// 실제 논문에서는 워크로드에 따라 동적으로 조정하지만, 여기선 정적 구간으로 구현
-#define ONE_SEC_NS  (1000000000ULL)
-#define THRESHOLD_HOT   (5ULL * ONE_SEC_NS)   // 0~5초: Hot
-#define THRESHOLD_WARM  (60ULL * ONE_SEC_NS)  // 5~60초: Warm
-#define THRESHOLD_COLD  (300ULL * ONE_SEC_NS) // 60~300초: Cold
-// 300초 이상: Frozen (Static Data)
+/* 시간 단위 매크로 (가독성 향상) */
+#define MS_TO_NS(x)     ((uint64_t)(x) * 1000000ULL)
+#define SEC_TO_NS(x)    ((uint64_t)(x) * 1000000000ULL)
 
-// 구간별 가중치 (Weight) - 가우스/S-Curve의 근사치
-// 오래된 데이터일수록(Cold) GC 효율(Benefit)이 급격히 높아지도록 설정
-static uint64_t get_age_weight(uint64_t age_ns)
+/* * [로그 데이터 기반 튜닝]
+ * - 0 ~ 100ms : Very Hot (로그의 7ms 데이터 보호)
+ * - 100ms ~ 5s : Hot (로그의 1.19s 데이터 보호)
+ * - 5s ~ 60s  : Warm (로그의 12s, 22s 데이터 유예)
+ * - 60s ~     : Cold (로그의 120s~169s 데이터들은 모두 여기 포함)
+ */
+#define THRESHOLD_VERY_HOT  MS_TO_NS(100)
+#define THRESHOLD_HOT       SEC_TO_NS(5)
+#define THRESHOLD_WARM      SEC_TO_NS(60)
+
+/*
+ * Age Weight Function (구간별 계단 함수)
+ * 반환값: 가중치 (클수록 GC 대상이 될 확률 높음)
+ */
+static uint64_t get_age_weight_tuned(uint64_t age_ns)
 {
-    if (age_ns < THRESHOLD_HOT) {
-        // [0 ~ 5초]: 매우 Hot한 데이터. 
-        // 방금 쓰였으므로 곧 무효화될 확률 높음 -> GC 하지 마라 (가중치 1)
-        return 1;
-    } 
+    // [Level 0] Very Hot (0 ~ 100ms)
+    // 방금 기록됨. 참조 국지성(Locality)에 의해 곧 다시 쓰일 확률 매우 높음.
+    // 절대 건드리지 않도록 최소 가중치 부여.
+    if (age_ns < THRESHOLD_VERY_HOT) {
+        return 1; 
+    }
+    
+    // [Level 1] Hot (100ms ~ 5s)
+    // 1초 내외의 데이터. 아직 활성 상태로 간주.
+    else if (age_ns < THRESHOLD_HOT) {
+        return 5;
+    }
+    
+    // [Level 2] Warm (5s ~ 60s)
+    // 12초, 22초 등 로그에서 보인 '식어가는' 데이터들.
+    // 당장 급하지 않다면 놔두는 게 좋음.
     else if (age_ns < THRESHOLD_WARM) {
-        // [5 ~ 60초]: Warm 데이터.
-        // Hot보다는 낫지만 여전히 접근 가능성 있음 -> (가중치 10)
-        return 10;
-    } 
-    else if (age_ns < THRESHOLD_COLD) {
-        // [60 ~ 300초]: Cold 데이터.
-        // 이제 안정화 단계 -> GC 하기에 적절함 (가중치 50)
-        return 50;
-    } 
+        return 20;
+    }
+    
+    // [Level 3] Cold / Frozen (60s ~ )
+    // 로그에서 120초~169초 데이터가 대거 발견됨.
+    // 이들은 사실상 '정적 데이터(Static Data)'이므로
+    // 무효 페이지(IPC)만 조금 있어도 즉시 청소하는 게 이득.
     else {
-        // [300초 ~ ]: Frozen 데이터.
-        // 거의 읽기만 하거나 방치된 데이터 -> 최고의 희생양 (가중치 100)
-        return 100;
+        return 100; // 가중치 최대 (GC 1순위)
     }
 }
 // ---------------------------------------------------------
@@ -270,7 +285,8 @@ static struct line *select_victim_cb(struct conv_ftl *conv_ftl, bool force)
         // - 삼항 연산자: 혹시라도 시간이 역전되는 오류를 방지하기 위해 0 처리
         uint64_t age = (now > cand->last_modified_time) ? 
                        (now - cand->last_modified_time) : 0;
-
+      
+        printk(KERN_INFO "Age: %llu\n", age);
         uint64_t age_weight = get_age_weight(age);
         // 11. Cost-Benefit 점수 계산
         // - 공식: Benefit(Age * IPC) / Cost(2 * VPC)
