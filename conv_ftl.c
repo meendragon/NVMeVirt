@@ -214,7 +214,7 @@ static struct line *select_victim_random(struct conv_ftl *conv_ftl, bool force)
  * Age Weight Function (구간별 계단 함수)
  * 반환값: 가중치 (클수록 GC 대상이 될 확률 높음)
  */
-static uint64_t get_age_weight_tuned(uint64_t age_ns)
+static uint64_t get_age_weight(uint64_t age_ns)
 {
     // [Level 0] Very Hot (0 ~ 100ms)
     // 방금 기록됨. 참조 국지성(Locality)에 의해 곧 다시 쓰일 확률 매우 높음.
@@ -1404,7 +1404,7 @@ static void conv_flush(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
             printk(KERN_INFO "NVMeVirt:  🔥 Hot Victims : %lu\n", hot_gc_cnt);
             printk(KERN_INFO "NVMeVirt:  🧊 Cold Victims: %lu\n", cold_gc_cnt);
             printk(KERN_INFO "NVMeVirt:  🧊 Cold Ratio  : %lu%%\n", (cold_gc_cnt * 100) / total_gc_cnt);
-            printk(KERN_INFO "NVMeVirt:  Average Age  : %lu%%\n", victim_total_age / victim_chosen_cnt);
+            printk(KERN_INFO "NVMeVirt:  Average Age  : %llu%%\n", victim_total_age / victim_chosen_cnt);
         } else {
             printk(KERN_INFO "NVMeVirt: [Hot/Cold Analysis] No GC triggered yet.\n");
         }

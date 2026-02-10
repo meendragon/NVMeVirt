@@ -1,11 +1,36 @@
 #!/bin/bash
-# 파일명: fio_cb_test.sh
+TARGET_DEV=/home/meen/NVMeVirt/mnt/hot_cold_file
 
-TARGET_DEV=/home/meen/nvmevirt/mnt/hot_cold_file
+# 안전을 위해 기존 파일 삭제
+sudo rm -f $TARGET_DEV
 
-echo "1. Pre-conditioning (Filling 700MB)..."
-echo "2. Hot/Cold Workload (Balanced for CB logic)..."
+echo "=================================================="
+echo "Phase 1: Pre-conditioning (Filling 11GB)"
+echo "=================================================="
 
+# [명령어 1] 오직 채우기만 수행
+# - creat_on_open=1: 파일을 생성함
+sudo fio --name=fill \
+    --filename=$TARGET_DEV \
+    --direct=1 \
+    --ioengine=libaio \
+    --rw=write \
+    --bs=128k \
+    --size=10G \
+    --numjobs=1 \
+    --fsync=1
+
+if [ $? -ne 0 ]; then
+    echo "Error: Fill phase failed. Check disk space."
+    exit 1
+fi
+
+echo "=================================================="
+echo "Phase 2: Hot/Cold Workload (CB Logic Test)"
+echo "=================================================="
+
+# [명령어 2] 실제 테스트 수행 (기존 파일 재사용)
+# - allow_file_create=0: 새 파일 만들지 말고 있는 거 써라 (에러 방지 핵심)
 sudo fio - <<EOF
 [global]
 filename=$TARGET_DEV
@@ -15,36 +40,21 @@ bs=4k
 norandommap=1
 randrepeat=0
 group_reporting
-time_based=0
-
-# ---------------------------------------------------------
-# [Step 1] 빈 공간 꽉 채우기 (변경 없음)
-# ---------------------------------------------------------
-[prepare_fill]
-rw=write
-size=700M
-numjobs=1
-stonewall
-
-# ---------------------------------------------------------
-# [Step 2] Hot/Cold (수정됨)
-# Hot에 제한을 걸어서 유효 페이지가 '즉시 0'이 되는 걸 방지함
-# ---------------------------------------------------------
-[hot_job]
-rw=randwrite
 time_based=1
 runtime=300
+allow_file_create=0  ; <--- 핵심: 이미 만든 파일 재사용
+
+[hot_job]
+rw=randwrite
 offset=0
-size=150M
-rate_iops=2500  ; <--- [핵심 수정] 무제한에서 2500으로 제한!
+size=2G
+rate_iops=15000     ; Hot 유지를 위한 고속 IO
 numjobs=1
 
 [cold_job]
 rw=randwrite
-time_based=1
-runtime=300
-offset=150M
-size=550M
-rate_iops=50    ; <--- [핵심 수정] Cold는 더 차갑게 (100 -> 50)
+offset=2G
+size=8G
+rate_iops=100       ; Cold 유지를 위한 저속 IO
 numjobs=1
 EOF
