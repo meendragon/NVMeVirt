@@ -8,9 +8,6 @@
 .*.cmd
 .tmp_versions/
 
-# 마운트 폴더 (무시)
-mnt/
-
 # 로컬 설정 파일 (무시)
 Makefile.local
 
