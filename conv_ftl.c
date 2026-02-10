@@ -5,6 +5,7 @@
 #include <linux/sched/clock.h> // 스케줄러 시계 관련 헤더
 #include <linux/moduleparam.h> // 파라미터 사용을 위한 헤더
 #include <linux/random.h> // get_random_u32() 함수 사용을 위해 필수
+#include <linux/types.h>
 
 #include "nvmev.h"      // NVMeVirt 공통 헤더
 #include "conv_ftl.h"   // Conventional FTL 헤더
@@ -192,6 +193,40 @@ static struct line *select_victim_random(struct conv_ftl *conv_ftl, bool force)
     return victim_line;
 }
 
+
+// 논문 기반 임계값 설정 (예시: 초 단위 -> 나노초 변환)
+// 실제 논문에서는 워크로드에 따라 동적으로 조정하지만, 여기선 정적 구간으로 구현
+#define ONE_SEC_NS  (1000000000ULL)
+#define THRESHOLD_HOT   (5ULL * ONE_SEC_NS)   // 0~5초: Hot
+#define THRESHOLD_WARM  (60ULL * ONE_SEC_NS)  // 5~60초: Warm
+#define THRESHOLD_COLD  (300ULL * ONE_SEC_NS) // 60~300초: Cold
+// 300초 이상: Frozen (Static Data)
+
+// 구간별 가중치 (Weight) - 가우스/S-Curve의 근사치
+// 오래된 데이터일수록(Cold) GC 효율(Benefit)이 급격히 높아지도록 설정
+static uint64_t get_age_weight(uint64_t age_ns)
+{
+    if (age_ns < THRESHOLD_HOT) {
+        // [0 ~ 5초]: 매우 Hot한 데이터. 
+        // 방금 쓰였으므로 곧 무효화될 확률 높음 -> GC 하지 마라 (가중치 1)
+        return 1;
+    } 
+    else if (age_ns < THRESHOLD_WARM) {
+        // [5 ~ 60초]: Warm 데이터.
+        // Hot보다는 낫지만 여전히 접근 가능성 있음 -> (가중치 10)
+        return 10;
+    } 
+    else if (age_ns < THRESHOLD_COLD) {
+        // [60 ~ 300초]: Cold 데이터.
+        // 이제 안정화 단계 -> GC 하기에 적절함 (가중치 50)
+        return 50;
+    } 
+    else {
+        // [300초 ~ ]: Frozen 데이터.
+        // 거의 읽기만 하거나 방치된 데이터 -> 최고의 희생양 (가중치 100)
+        return 100;
+    }
+}
 // ---------------------------------------------------------
 // 전략 3: Cost-Benefit - 전체 스캔 (Linear Scan, O(N))
 // ---------------------------------------------------------
@@ -235,10 +270,12 @@ static struct line *select_victim_cb(struct conv_ftl *conv_ftl, bool force)
         // - 삼항 연산자: 혹시라도 시간이 역전되는 오류를 방지하기 위해 0 처리
         uint64_t age = (now > cand->last_modified_time) ? 
                        (now - cand->last_modified_time) : 0;
+
+        uint64_t age_weight = get_age_weight(age);
         // 11. Cost-Benefit 점수 계산
         // - 공식: Benefit(Age * IPC) / Cost(2 * VPC)
         // - (cand->vpc + 1): 분모가 0이 되어 프로그램이 죽는 것을 방지
-        uint64_t numerator= age * cand->ipc;
+        uint64_t numerator= age_weight * cand->ipc;
         uint64_t score =  numerator / (cand->vpc + 1);
         // 12. 현재 블록의 점수가 지금까지 찾은 최대 점수보다 높은지 확인
         if (score > max_score) {

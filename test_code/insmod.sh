@@ -4,13 +4,12 @@
 # 예: ./insmod.sh 1  -> gc_mode=1로 로드
 # 예: ./insmod.sh    -> gc_mode=0(기본값)으로 로드
 
-# 첫 번째 인자를 GC_MODE로 사용 (없으면 기본값 0)
 GC_MODE=${1:-0}
 
-# 설정 변수 (필요하면 여기서 수정하세요)
-MEM_START="4G"
-MEM_SIZE="1024M"
-CPUS="1,2"
+# 설정 변수 (수정됨)
+MEM_START="4G"    # 4G -> 12G로 변경 (GRUB 예약 위치랑 맞춰야 함!)
+MEM_SIZE="12288M"   # 1024M -> 4096M (아까 4G 예약했으니, 꽉 채워 쓰는 게 이득)
+CPUS="1,2,3,4"
 
 # [추가] 디버그 모드 설정 (1=On, 0=Off)
 DEBUG_MODE=1
@@ -27,7 +26,7 @@ else
 fi
 
 # 2. 모듈 삽입
-MODULE_PATH="/home/meen/nvmevirt/nvmev.ko"
+MODULE_PATH="/home/meen/NVMeVirt/nvmev.ko"
 echo "🚀 nvmev.ko 로드 중... (GC_MODE=$GC_MODE)"
 CMD="sudo insmod $MODULE_PATH memmap_start=$MEM_START memmap_size=$MEM_SIZE cpus=$CPUS gc_mode=$GC_MODE debug_mode=$DEBUG_MODE"
 echo "   Command: $CMD"
