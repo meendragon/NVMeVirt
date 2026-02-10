@@ -18,7 +18,7 @@ module_param(debug_mode, int, 0644);
 /* ========================================================= */
 /* [Meen's Debug] Hot/Cold GC 카운터 및 기준 설정 */
 /* 150MB 지점 LPN = 38400 (FIO 스크립트 기준) */
-#define HOT_REGION_LPN_LIMIT  38400
+#define HOT_REGION_LPN_LIMIT  524288
 
 static unsigned long total_gc_cnt = 0; // 총 GC 횟수
 static unsigned long hot_gc_cnt = 0;   // Hot 블록이 잡힌 횟수
