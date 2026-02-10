@@ -1404,7 +1404,7 @@ static void conv_flush(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
             printk(KERN_INFO "NVMeVirt:  🔥 Hot Victims : %lu\n", hot_gc_cnt);
             printk(KERN_INFO "NVMeVirt:  🧊 Cold Victims: %lu\n", cold_gc_cnt);
             printk(KERN_INFO "NVMeVirt:  🧊 Cold Ratio  : %lu%%\n", (cold_gc_cnt * 100) / total_gc_cnt);
-            printk(KERN_INFO "NVMeVirt:  Average Age  : %llu%%\n", victim_total_age / victim_chosen_cnt);
+            printk(KERN_INFO "NVMeVirt:  Average Age  : %llu old\n", victim_total_age / victim_chosen_cnt);
         } else {
             printk(KERN_INFO "NVMeVirt: [Hot/Cold Analysis] No GC triggered yet.\n");
         }
