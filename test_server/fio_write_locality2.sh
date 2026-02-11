@@ -55,6 +55,6 @@ numjobs=1
 rw=randwrite
 offset=2G
 size=8G
-rate_iops=100       ; Cold 유지를 위한 저속 IO
+rate_iops=1000       ; Cold 유지를 위한 저속 IO
 numjobs=1
 EOF
