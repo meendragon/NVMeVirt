@@ -45,7 +45,7 @@ struct write_pointer {
 // 전체 라인들의 상태(Free, Victim, Full)를 관리하는 구조체
 struct line_mgmt {
     struct line *lines; // 모든 라인 정보를 담고 있는 배열
-
+    
     /* free line list, we only need to maintain a list of blk numbers */
     struct list_head free_line_list; // 빈 라인(Free Line)들을 관리하는 리스트
     pqueue_t *victim_line_pq;        // 데이터가 차 있고 GC 대상이 될 라인들을 관리하는 우선순위 큐

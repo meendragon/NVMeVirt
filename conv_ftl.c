@@ -12,9 +12,11 @@
 
 // conv_ftl.c 상단 전역 변수 영역
 static int gc_mode = 0; // 0:Greedy, 1:CB, 2:Random
-static int debug_mode = 0;    // debug mode == 1;
-module_param(gc_mode, int, 0644); // insmod 할 때 gc_mode=2 처럼 입력 가능
-module_param(debug_mode, int, 0644);
+static bool slc_buf = false;
+
+module_param(gc_mode, int, 0644);
+module_param(slc_buf, bool, 0644);
+
 /* ========================================================= */
 /* [Meen's Debug] Hot/Cold GC 카운터 및 기준 설정 */
 /* 150MB 지점 LPN = 38400 (FIO 스크립트 기준) */
@@ -23,9 +25,10 @@ module_param(debug_mode, int, 0644);
 static unsigned long total_gc_cnt = 0; // 총 GC 횟수
 static unsigned long hot_gc_cnt = 0;   // Hot 블록이 잡힌 횟수
 static unsigned long cold_gc_cnt = 0;  // Cold 블록이 잡힌 횟수
-/* ========================================================= */
 static uint64_t victim_total_age = 0;
 static uint64_t victim_chosen_cnt = 0;
+/* ==================================== ===================== */
+
 // 현재 페이지가 워드라인(Wordline)의 마지막 페이지인지 확인하는 함수
 static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
@@ -1091,9 +1094,8 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
     if (!victim_line) {
         return -1; // 선택 실패 시 리턴
     }
-    if(debug_mode){
-        count_gc_victim_type(conv_ftl, victim_line);
-    }
+    count_gc_victim_type(conv_ftl, victim_line);
+    
     conv_ftl->gc_count++;
     ppa.g.blk = victim_line->id;
     ppa.g.blk = victim_line->id; // 선택된 라인 ID를 블록 주소로 설정
@@ -1384,31 +1386,30 @@ static void conv_flush(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
     }
     
     NVMEV_DEBUG_VERBOSE("%s: latency=%llu\n", __func__, latest - start);
-    if (debug_mode) {
-		uint64_t total_gc = 0;
-		uint64_t total_copied = 0;
-		
-		for (i = 0; i < ns->nr_parts; i++) {
-			total_gc += conv_ftls[i].gc_count;
-			total_copied += conv_ftls[i].gc_copied_pages;
-		}
-		
-		printk(KERN_INFO "NVMeVirt: [FLUSH - Final GC Stats]\n");
-		printk(KERN_INFO "NVMeVirt:  Total GC Count: %llu\n", total_gc);
-		printk(KERN_INFO "NVMeVirt:  Total Copied Pages: %llu\n", total_copied);
-		printk(KERN_INFO "NVMeVirt:  Avg Pages per GC: %llu\n", 
-		       total_gc > 0 ? total_copied / total_gc : 0);
-        if (total_gc_cnt > 0) {
-            printk(KERN_INFO "NVMeVirt: [Hot/Cold Analysis]\n");
-            printk(KERN_INFO "NVMeVirt:  Total Sampled GC: %lu\n", total_gc_cnt);
-            printk(KERN_INFO "NVMeVirt:  🔥 Hot Victims : %lu\n", hot_gc_cnt);
-            printk(KERN_INFO "NVMeVirt:  🧊 Cold Victims: %lu\n", cold_gc_cnt);
-            printk(KERN_INFO "NVMeVirt:  🧊 Cold Ratio  : %lu%%\n", (cold_gc_cnt * 100) / total_gc_cnt);
-            printk(KERN_INFO "NVMeVirt:  Average Age  : %llu old\n", victim_total_age / victim_chosen_cnt);
-        } else {
-            printk(KERN_INFO "NVMeVirt: [Hot/Cold Analysis] No GC triggered yet.\n");
-        }
-	}
+    uint64_t total_gc = 0;
+    uint64_t total_copied = 0;
+    
+    for (i = 0; i < ns->nr_parts; i++) {
+        total_gc += conv_ftls[i].gc_count;
+        total_copied += conv_ftls[i].gc_copied_pages;
+    }
+    
+    printk(KERN_INFO "NVMeVirt: [FLUSH - Final GC Stats]\n");
+    printk(KERN_INFO "NVMeVirt:  Total GC Count: %llu\n", total_gc);
+    printk(KERN_INFO "NVMeVirt:  Total Copied Pages: %llu\n", total_copied);
+    printk(KERN_INFO "NVMeVirt:  Avg Pages per GC: %llu\n", 
+            total_gc > 0 ? total_copied / total_gc : 0);
+    if (total_gc_cnt > 0) {
+        printk(KERN_INFO "NVMeVirt: [Hot/Cold Analysis]\n");
+        printk(KERN_INFO "NVMeVirt:  Total Sampled GC: %lu\n", total_gc_cnt);
+        printk(KERN_INFO "NVMeVirt:  🔥 Hot Victims : %lu\n", hot_gc_cnt);
+        printk(KERN_INFO "NVMeVirt:  🧊 Cold Victims: %lu\n", cold_gc_cnt);
+        printk(KERN_INFO "NVMeVirt:  🧊 Cold Ratio  : %lu%%\n", (cold_gc_cnt * 100) / total_gc_cnt);
+        printk(KERN_INFO "NVMeVirt:  Average Age  : %llu old\n", victim_total_age / victim_chosen_cnt);
+    } else {
+        printk(KERN_INFO "NVMeVirt: [Hot/Cold Analysis] No GC triggered yet.\n");
+    }
+	
     ret->status = NVME_SC_SUCCESS;
     ret->nsecs_target = latest; // 완료 목표 시간 설정
     return;
