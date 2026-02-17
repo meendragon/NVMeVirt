@@ -330,6 +330,8 @@ static void init_lines(struct conv_ftl *conv_ftl)
 {
     struct ssdparams *spp = &conv_ftl->ssd->sp; // SSD 파라미터
     struct line_mgmt *lm = &conv_ftl->lm; // 라인 관리자
+    struct line_mgmt *slc_lm = &conv_ftl->slc_lm;
+    struct line_mgmt *tlc_lm = &conv_ftl->tlc_lm;
 
     struct line *line;
 
@@ -378,6 +380,10 @@ static void init_lines(struct conv_ftl *conv_ftl)
                                         victim_line_set_pos);
 
     lm->free_line_cnt = 0; // 프리 라인 카운트 초기화
+    INIT_LIST_HEAD(&slc_lm->free_line_list);
+    INIT_LIST_HEAD(&tlc_lm->free_line_list);
+    slc_lm->free_line_cnt = 0;
+    tlc_lm->free_line_cnt = 0;
     for (i = 0; i < lm->tt_lines; i++) { // 모든 라인에 대해 루프
         lm->lines[i] = (struct line){
             .id = i, // 라인 ID 설정
@@ -390,10 +396,21 @@ static void init_lines(struct conv_ftl *conv_ftl)
 
         /* initialize all the lines as free lines */
         // 초기에는 모든 라인을 프리 라인 리스트에 추가
-        list_add_tail(&lm->lines[i].entry, &lm->free_line_list);
-        lm->free_line_cnt++; // 프리 라인 카운트 증가
+        if (conv_ftl->slc_enabled && i < conv_ftl->slc_line_limit){
+            list_add_tail(&lm->lines[i].entry, &slc_lm->free_line_list);
+            slc_lm->free_line_cnt++;
+        }else{
+            list_add_tail(&lm->lines[i].entry, &tlc_lm->free_line_list);
+            tlc_lm->free_line_cnt++;
+        }
+        lm->free_line_cnt++;
     }
-
+    if (conv_ftl->slc_enabled) {
+        NVMEV_ASSERT(slc_lm->free_line_cnt + tlc_lm->free_line_cnt
+                    == lm->tt_lines);
+    } else {
+        NVMEV_ASSERT(tlc_lm->free_line_cnt == lm->tt_lines);
+    }
     NVMEV_ASSERT(lm->free_line_cnt == lm->tt_lines); // 모든 라인이 프리 상태인지 확인
     lm->victim_line_cnt = 0; // 희생 후보 라인 수 0
     lm->full_line_cnt = 0; // 꽉 찬 라인 수 0
@@ -604,11 +621,17 @@ static void remove_rmap(struct conv_ftl *conv_ftl)
 // FTL 인스턴스 초기화 함수
 static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, struct ssd *ssd)
 {
+    struct ssdparams *spp = &ssd->sp;
     /*copy convparams*/
     conv_ftl->cp = *cpp; // 파라미터 복사
 
     conv_ftl->ssd = ssd; // SSD 포인터 연결
 
+    conv_ftl->slc_enabled = slc_buf; // 모듈에서 세팅한 slc_buf모드로 확정짓기 struct에서 들고 있기
+
+    if (conv_ftl->slc_enabled) {
+        conv_ftl->slc_line_limit = spp->blks_per_pl * SLC_PORTION / 100; //라인 할당
+    }
     conv_ftl->gc_count = 0;
     conv_ftl->gc_copied_pages = 0;
     /* initialize maptbl */

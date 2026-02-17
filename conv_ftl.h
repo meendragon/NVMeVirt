@@ -83,6 +83,9 @@ struct conv_ftl {
 
     uint64_t gc_count;              // 총 GC 수행 횟수
     uint64_t gc_copied_pages;       // GC로 복사된 총 페이지 수
+
+    bool slc_enabled;
+    u32 slc_line_limit;
 };
 
 // 네임스페이스 초기화 및 FTL 인스턴스 생성 함수 선언
