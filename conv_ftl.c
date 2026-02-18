@@ -440,9 +440,18 @@ static inline void check_addr(int a, int max)
 }
 
 // 프리 라인 리스트에서 다음 빈 라인을 가져오는 함수
-static struct line *get_next_free_line(struct conv_ftl *conv_ftl)
+static struct line *get_next_free_line(struct conv_ftl *conv_ftl, uint32_t io_type)
 {
-    struct line_mgmt *lm = conv_ftl->slc_enabled ? &conv_ftl->slc_lm : &conv_ftl->tlc_lm;
+    struct line_mgmt *lm;
+    if (io_type == GC_IO) {
+        lm = &ftl->tlc_lm;                 // GC는 TLC 강제
+    } else if (io_type == USER_IO) {
+        lm = ftl->slc_enabled ? &ftl->slc_lm : &ftl->tlc_lm;
+    } else {
+        NVMEV_ASSERT(0);
+        return NULL;
+    }
+    
     struct line *curline = list_first_entry_or_null(&lm->free_line_list,struct line, entry);
  
     if (!curline) {
@@ -464,7 +473,7 @@ static struct line *get_next_free_line(struct conv_ftl *conv_ftl)
 static struct write_pointer *__get_wp(struct conv_ftl *ftl, uint32_t io_type)
 {
     if (io_type == USER_IO) { // 유저 쓰기인 경우
-        return &ftl->wp; // 유저용 쓰기 포인터 반환
+        return ftl->slc_enabled ? &ftl->slc_wp : &ftl->tlc_wp; // 유저용 쓰기 포인터 반환
     } else if (io_type == GC_IO) { // GC 쓰기(Valid Page Copy)인 경우
         return &ftl->gc_wp; // GC용 쓰기 포인터 반환
     }
@@ -477,7 +486,7 @@ static struct write_pointer *__get_wp(struct conv_ftl *ftl, uint32_t io_type)
 static void prepare_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 {
     struct write_pointer *wp = __get_wp(conv_ftl, io_type); // 해당 타입의 포인터 가져오기
-    struct line *curline = get_next_free_line(conv_ftl); // 새 빈 라인 할당
+    struct line *curline = get_next_free_line(conv_ftl,io_type); // 새 빈 라인 할당
 
     NVMEV_ASSERT(wp); // 포인터 유효성 검사
     NVMEV_ASSERT(curline); // 라인 유효성 검사
@@ -498,9 +507,16 @@ static void prepare_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 {
     struct ssdparams *spp = &conv_ftl->ssd->sp; // SSD 파라미터
-    struct line_mgmt *lm = &conv_ftl->lm; // 라인 관리자
+    struct line_mgmt *lm;
+    if(io_type == USER_IO){
+        lm = &conv_ftl->slc_enabled ? &conv_ftl->slc_lm : &conv_ftl->tlc_lm;
+    }else if(io_type == GC_IO){
+        lm = conv_ftl->tlc_lm;
+    }else{
+        NVMEV_ASSERT(0);
+        return;
+    }
     struct write_pointer *wpp = __get_wp(conv_ftl, io_type); // 현재 쓰기 포인터
-
     // 디버그용: 현재 포인터 위치 출력
     NVMEV_DEBUG_VERBOSE("current wpp: ch:%d, lun:%d, pl:%d, blk:%d, pg:%d\n",
             wpp->ch, wpp->lun, wpp->pl, wpp->blk, wpp->pg);
@@ -548,7 +564,7 @@ static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
     }
     /* current line is used up, pick another empty line */
     check_addr(wpp->blk, spp->blks_per_pl); // 블록 주소 검사
-    wpp->curline = get_next_free_line(conv_ftl); // 새 프리 라인(오픈 블록) 가져오기
+    wpp->curline = get_next_free_line(conv_ftl,io_type); // 새 프리 라인(오픈 블록) 가져오기
     NVMEV_DEBUG_VERBOSE("wpp: got new clean line %d\n", wpp->curline->id);
 
     wpp->blk = wpp->curline->id; // 새 라인의 ID를 현재 블록으로 설정
@@ -1295,106 +1311,162 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 // NVMe 쓰기 명령 처리 함수
 static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
 {
+    // ns->ftls 는 여러 파티션/인스턴스(conv_ftl[])를 가질 수 있음
     struct conv_ftl *conv_ftls = (struct conv_ftl *)ns->ftls;
     struct conv_ftl *conv_ftl = &conv_ftls[0];
 
     /* wbuf and spp are shared by all instances */
+    // ssdparams(spp): NAND geometry/타이밍 파라미터(페이지 크기 등)
     struct ssdparams *spp = &conv_ftl->ssd->sp;
+     // write_buffer(wbuf): 호스트 write가 먼저 도착하는 DRAM 버퍼(시뮬레이션)
     struct buffer *wbuf = conv_ftl->ssd->write_buffer; // 쓰기 버퍼
-
+    // 요청에서 NVMe RW 커맨드 읽기
     struct nvme_command *cmd = req->cmd;
+    // 시작 LBA / 길이(0-base length라 +1) / 페이지 단위로 범위 계산
     uint64_t lba = cmd->rw.slba; // 시작 LBA
     uint64_t nr_lba = (cmd->rw.length + 1); // 길이
-    uint64_t start_lpn = lba / spp->secs_per_pg; // 시작 LPN
-    uint64_t end_lpn = (lba + nr_lba - 1) / spp->secs_per_pg; // 끝 LPN
+    // LPN(Logical Page Number): LBA를 페이지 크기(섹터/페이지)로 나눈 논리 페이지 인덱스
+    uint64_t start_lpn = lba / spp->secs_per_pg;
+    uint64_t end_lpn = (lba + nr_lba - 1) / spp->secs_per_pg;
 
     uint64_t lpn;
-    uint32_t nr_parts = ns->nr_parts;
+    uint32_t nr_parts = ns->nr_parts; // 파티션 수(스트라이핑/병렬화)
 
-    uint64_t nsecs_latest;
-    uint64_t nsecs_xfer_completed;
-    uint32_t allocated_buf_size;
+    // 타이밍 시뮬레이션 변수
+    uint64_t nsecs_latest;          // 지금까지의 최종 완료 시간(최댓값)
+    uint64_t nsecs_xfer_completed;  // 호스트->버퍼 전송이 끝난 시각(early completion 기준)
+    uint32_t allocated_buf_size;    // wbuf에서 실제 확보한 크기
 
+    // NAND에 실제 program을 날릴 때 사용하는 내부 명령 구조체
+    // - 여기서는 USER_IO + NAND_WRITE로 설정
+    // - 중요: SLC/TLC 버퍼 정책을 구현할 때,
+    //         "USER_IO로 내려가면 USER용 WP/라인풀"이 사용되도록 아래 경로(get_new_page/advance_wp)가 일관돼야 함.
     struct nand_cmd swr = {
         .type = USER_IO,
         .cmd = NAND_WRITE,
         .interleave_pci_dma = false,
-        .xfer_size = spp->pgsz * spp->pgs_per_oneshotpg, // 원샷 크기 설정
+
+        // oneshotpg(=wordline 단위)로 모아서 한 번에 program하는 모델일 수 있음
+        // xfer_size는 그 oneshot 크기(페이지 크기 * oneshot에 포함되는 페이지 수)
+        .xfer_size = spp->pgsz * spp->pgs_per_oneshotpg,
     };
 
     NVMEV_DEBUG_VERBOSE("%s: start_lpn=%lld, len=%lld, end_lpn=%lld", __func__, start_lpn, nr_lba, end_lpn);
-    if ((end_lpn / nr_parts) >= spp->tt_pgs) { // 범위 초과 검사
+    // 범위 초과 검사: (end_lpn / nr_parts) 가 전체 페이지 범위를 넘는지 확인
+    if ((end_lpn / nr_parts) >= spp->tt_pgs) {
         NVMEV_ERROR("%s: lpn passed FTL range (start_lpn=%lld > tt_pgs=%ld)\n",
-                __func__, start_lpn, spp->tt_pgs);
+                    __func__, start_lpn, spp->tt_pgs);
         return false;
     }
 
-    allocated_buf_size = buffer_allocate(wbuf, LBA_TO_BYTE(nr_lba)); // 쓰기 버퍼 할당
-    if (allocated_buf_size < LBA_TO_BYTE(nr_lba)) // 버퍼 부족 시
-        return false; // 실패
+    // (1) 호스트 write 데이터를 write_buffer에 적재(할당) - 이 단계가 early completion의 기준이 되기도 함
+    allocated_buf_size = buffer_allocate(wbuf, LBA_TO_BYTE(nr_lba));
+    if (allocated_buf_size < LBA_TO_BYTE(nr_lba))
+        return false;
 
-    // 버퍼 쓰기 시뮬레이션 및 시간 계산
-    nsecs_latest =
-        ssd_advance_write_buffer(conv_ftl->ssd, req->nsecs_start, LBA_TO_BYTE(nr_lba));
+    // (2) write_buffer로의 전송/버퍼링 시간 시뮬레이션
+    // nsecs_latest: 버퍼에 데이터가 들어오는 데 걸리는 시간이 반영됨
+    nsecs_latest = ssd_advance_write_buffer(conv_ftl->ssd,
+                                            req->nsecs_start,
+                                            LBA_TO_BYTE(nr_lba));
     nsecs_xfer_completed = nsecs_latest;
 
+    // NAND program 명령의 시작 시각 설정
     swr.stime = nsecs_latest;
 
-    for (lpn = start_lpn; lpn <= end_lpn; lpn++) { // LPN 순회
+    // (3) 실제 FTL 업데이트: LPN 단위로 순회
+    // - LPN별로 "기존 페이지 invalidate → 새 PPA 할당 → map/rmap 갱신 → WP 전진"
+    for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
         uint64_t local_lpn;
         uint64_t nsecs_completed = 0;
         struct ppa ppa;
 
+        // 파티셔닝: lpn % nr_parts 로 어느 ftl 인스턴스를 쓸지 결정
+        // (stripe 분산). local_lpn은 해당 파티션 내부 LPN
         conv_ftl = &conv_ftls[lpn % nr_parts];
         local_lpn = lpn / nr_parts;
-        ppa = get_maptbl_ent(
-            conv_ftl, local_lpn); // Check whether the given LPN has been written before
-                                  // 기존 매핑 확인
+
+        // (3-1) 기존 매핑 확인
+        // - 이미 쓰여진 LPN이면 old PPA가 나오며, update write면 invalidate 처리가 필요
+        ppa = get_maptbl_ent(conv_ftl, local_lpn);
         if (mapped_ppa(&ppa)) {
             /* update old page information first */
-            mark_page_invalid(conv_ftl, &ppa); // 기존 페이지 무효화
-            set_rmap_ent(conv_ftl, INVALID_LPN, &ppa); // 역매핑 삭제
+            // 기존 물리 페이지 무효화(유효/무효 비트맵, line vpc 등 갱신)
+            mark_page_invalid(conv_ftl, &ppa);
+
+            // 역매핑에서도 해당 PPA에 매달린 LPN을 지움(또는 INVALID로 설정)
+            set_rmap_ent(conv_ftl, INVALID_LPN, &ppa);
+
             NVMEV_DEBUG("%s: %lld is invalid, ", __func__, ppa2pgidx(conv_ftl, &ppa));
         }
-
         /* new write */
-        ppa = get_new_page(conv_ftl, USER_IO); // 새 페이지(PPA) 할당 (쓰기 포인터에서)
+        // (3-2) 새 물리 페이지 할당
+        // ★ 여기서 USER_IO를 넘기는 게 핵심:
+        //   - get_new_page 내부에서 __get_wp(USER_IO)로 USER용 WP(SLC/TLC) 선택
+        //   - 라인 소진 시 prepare_write_pointer(USER_IO) 호출
+        //   - 너의 정책: SLC 버퍼면 USER는 SLC(또는 상황에 따라 TLC), GC는 TLC 강제
+        //   → 이 정책이 깨지지 않도록 get_new_page/advance_wp 쪽을 수정해야 함
+        ppa = get_new_page(conv_ftl, USER_IO);
+
         /* update maptbl */
-        set_maptbl_ent(conv_ftl, local_lpn, &ppa); // 매핑 테이블 갱신
+        // (3-3) 매핑테이블 업데이트: local_lpn -> 새 ppa
+        set_maptbl_ent(conv_ftl, local_lpn, &ppa);
         NVMEV_DEBUG("%s: got new ppa %lld, ", __func__, ppa2pgidx(conv_ftl, &ppa));
+
         /* update rmap */
-        set_rmap_ent(conv_ftl, local_lpn, &ppa); // 역매핑 테이블 갱신
-        
-        mark_page_valid(conv_ftl, &ppa); // 새 페이지 유효화
-   
+        // (3-4) 역매핑 업데이트: 새 ppa -> local_lpn
+        set_rmap_ent(conv_ftl, local_lpn, &ppa);
+
+        // (3-5) 새 페이지 valid 처리(라인의 valid page count, bitmap 등)
+        mark_page_valid(conv_ftl, &ppa);
+
         /* need to advance the write pointer here */
-        advance_write_pointer(conv_ftl, USER_IO); // 쓰기 포인터 전진
+        // (3-6) write pointer 전진
+        // ★ 이것도 USER_IO를 넘기는 게 핵심:
+        //   - 페이지/워드라인/블록/라인 경계를 넘어갈 때
+        //   - 라인이 꽉 차면 "현재 라인을 full로 전이 + 새 라인 할당(prepare_write_pointer)"
+        //   - 여기서 USER_IO/GC_IO를 구분 못하면 GC가 SLC 라인에 들어가거나 반대 문제가 발생
+        advance_write_pointer(conv_ftl, USER_IO);
 
         /* Aggregate write io in flash page */
-        // 원샷 프로그램 단위가 찼을 때 실제 NAND 쓰기 명령 발생
+        // (4) oneshot(wordline) 단위로 모아서 NAND program을 발행하는 모델:
+        // - last_pg_in_wordline()이 true일 때만 실제 NAND_WRITE를 시뮬레이션한다.
+        // - 즉, 매 LPN마다 바로 NAND에 쓰는 게 아니라, 내부적으로 "모아서" 쓰는 구조.
         if (last_pg_in_wordline(conv_ftl, &ppa)) {
+            // 이번 oneshot program을 대표하는 ppa를 swr에 넣는다
             swr.ppa = &ppa;
 
-            nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &swr); // NAND 쓰기 시뮬레이션
+            // NAND program 시뮬레이션 수행
+            nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &swr);
             nsecs_latest = max(nsecs_completed, nsecs_latest);
 
-            schedule_internal_operation(req->sq_id, nsecs_completed, wbuf,
-                            spp->pgs_per_oneshotpg * spp->pgsz); // 내부 연산 스케줄링
+            // 내부 연산(프로그램) 완료 시점에 buffer 소비/반납 등을 스케줄링
+            schedule_internal_operation(req->sq_id,
+                                        nsecs_completed,
+                                        wbuf,
+                                        spp->pgs_per_oneshotpg * spp->pgsz);
         }
-
-        consume_write_credit(conv_ftl); // 크레딧 소모
-        check_and_refill_write_credit(conv_ftl); // 크레딧 확인 및 필요 시 GC (Foreground GC)
+        // (5) 크레딧 기반 제어
+        // - write credit은 모델에서 write/GC 타이밍 또는 병목을 제어하는 장치일 가능성이 큼
+        // - check_and_refill_write_credit()가 foreground GC를 트리거할 수 있음
+        // ★ 여기서 GC가 돌면:
+        //   - GC 경로의 nand_cmd.type == GC_IO 가 되어야 하고
+        //   - get_new_page/advance_wp 호출도 GC_IO로 내려가야 "GC는 TLC 라인 강제"가 보장됨
+        consume_write_credit(conv_ftl);
+        check_and_refill_write_credit(conv_ftl);
     }
-
+    // (6) NVMe completion 타이밍 결정
+    // - FUA 또는 early completion 비활성화면: 실제 NAND 작업까지 기다림(nsecs_latest)
+    // - 아니면: 버퍼 전송 완료 시점에 조기 완료(nsecs_xfer_completed)
     if ((cmd->rw.control & NVME_RW_FUA) || (spp->write_early_completion == 0)) {
         /* Wait all flash operations */
-        ret->nsecs_target = nsecs_latest; // 모든 플래시 작업 완료 대기 (FUA 설정 시)
+        ret->nsecs_target = nsecs_latest;
     } else {
         /* Early completion */
-        ret->nsecs_target = nsecs_xfer_completed; // 버퍼 전송 완료 시점 반환 (빠른 응답)
+        ret->nsecs_target = nsecs_xfer_completed;
     }
-    ret->status = NVME_SC_SUCCESS; // 성공
 
+    ret->status = NVME_SC_SUCCESS;
     return true;
 }
 
