@@ -442,18 +442,21 @@ static inline void check_addr(int a, int max)
 // 프리 라인 리스트에서 다음 빈 라인을 가져오는 함수
 static struct line *get_next_free_line(struct conv_ftl *conv_ftl)
 {
-    struct line_mgmt *lm = &conv_ftl->lm; // 라인 관리자
-    // 프리 라인 리스트의 첫 번째 항목 가져오기
-    struct line *curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
-
-    if (!curline) { // 프리 라인이 없으면
-        NVMEV_ERROR("No free line left in VIRT !!!!\n"); // 에러 출력
-        return NULL; // NULL 반환
+    struct line_mgmt *lm = conv_ftl->slc_enabled ? &conv_ftl->slc_lm : &conv_ftl->tlc_lm;
+    struct line *curline = list_first_entry_or_null(&lm->free_line_list,struct line, entry);
+ 
+    if (!curline) {
+        NVMEV_ERROR("No free line left in VIRT (%s)!!!!\n",
+                    conv_ftl->slc_enabled ? "SLC" : "TLC");
+        return NULL;
     }
+    // 프리 라인 리스트의 첫 번째 항목 가져오기
+    list_del_init(&curline->entry);
+    lm->free_line_cnt--; 
+    NVMEV_DEBUG("%s: %s free_line_cnt %d\n", __func__,
+                conv_ftl->slc_enabled ? "SLC" : "TLC",
+                lm->free_line_cnt);
 
-    list_del_init(&curline->entry); // 리스트에서 제거
-    lm->free_line_cnt--; // 프리 라인 카운트 감소
-    NVMEV_DEBUG("%s: free_line_cnt %d\n", __func__, lm->free_line_cnt); // 디버그 로그
     return curline; // 라인 반환
 }
 
