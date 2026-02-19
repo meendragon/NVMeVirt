@@ -85,7 +85,7 @@ static void check_params(struct ssdparams *spp)
 // ========================================================
 void ssd_init_params(struct ssdparams *spp, uint64_t capacity, uint32_t nparts)
 {
-    uint64_t blk_size, total_size;
+    uint64_t blk_size,slc_blk_size,total_size;
 
     // 섹터 및 페이지 크기 설정
     spp->secsz = LBA_SIZE;              // 보통 512B
@@ -107,8 +107,11 @@ void ssd_init_params(struct ssdparams *spp, uint64_t capacity, uint32_t nparts)
     if (BLKS_PER_PLN > 0) {
         // 블록 개수가 명시된 경우
         spp->blks_per_pl = BLKS_PER_PLN;
+        spp->slc_blks_per_pl = SLC_BLKS;
         // 용량을 역산하여 블록 크기 추정
         blk_size = DIV_ROUND_UP(capacity, spp->blks_per_pl * spp->pls_per_lun *
+                              spp->luns_per_ch * spp->nchs);
+        slc_blk_size = DIV_ROUND_UP(capacity, spp->slc_blks_per_pl * spp->pls_per_lun *
                               spp->luns_per_ch * spp->nchs);
     } else {
         // 블록 크기가 명시된 경우 (보통 ZNS 등)
@@ -125,10 +128,14 @@ void ssd_init_params(struct ssdparams *spp, uint64_t capacity, uint32_t nparts)
 
     // 내부 관리 단위 계산
     spp->pgs_per_oneshotpg = ONESHOT_PAGE_SIZE / (spp->pgsz); // 원샷 당 4KB 페이지 수
+    spp->slc_pgs_per_oneshotpg = SLC_ONESHOT_PAGE_SIZE / (spp->pgsz);
     spp->oneshotpgs_per_blk = DIV_ROUND_UP(blk_size, ONESHOT_PAGE_SIZE);
+    spp->slc_oneshotpgs_per_blk = DIV_ROUND_UP(slc_blk_size, SLC_ONESHOT_PAGE_SIZE);
 
     spp->pgs_per_flashpg = FLASH_PAGE_SIZE / (spp->pgsz);
     spp->flashpgs_per_blk = (ONESHOT_PAGE_SIZE / FLASH_PAGE_SIZE) * spp->oneshotpgs_per_blk;
+
+    
 
     spp->pgs_per_blk = spp->pgs_per_oneshotpg * spp->oneshotpgs_per_blk; // 블록 당 총 페이지 수
 
@@ -149,6 +156,11 @@ void ssd_init_params(struct ssdparams *spp, uint64_t capacity, uint32_t nparts)
     spp->pg_wr_lat = NAND_PROG_LATENCY; // 쓰기 시간 (tPROG)
     spp->blk_er_lat = NAND_ERASE_LATENCY; // 지우기 시간 (tBERS)
     spp->max_ch_xfer_size = MAX_CH_XFER_SIZE;
+
+    spp->slc_pg_4kb_rd_lat = NAND_4KB_READ_LATENCY_SLC;
+    spp->slc_pg_rd_lat = NAND_READ_LATENCY_SLC;
+    spp->slc_pg_wr_lat = NAND_PROG_LATENCY_SLC; // 쓰기 시간 (tPROG)
+    spp->slc_blk_er_lat = NAND_ERASE_LATENCY_SLC; // 지우기 시간 (tBERS)
 
     // 펌웨어(F/W) 오버헤드 시뮬레이션 값
     spp->fw_4kb_rd_lat = FW_4KB_READ_LATENCY;
@@ -190,7 +202,8 @@ void ssd_init_params(struct ssdparams *spp, uint64_t capacity, uint32_t nparts)
     spp->pgs_per_line = spp->blks_per_line * spp->pgs_per_blk;
     spp->secs_per_line = spp->pgs_per_line * spp->secs_per_pg;
     spp->tt_lines = spp->blks_per_lun; // 라인 개수 = LUN당 블록 수
-
+    spp->slc_tt_lines = spp->tt_lines * SLC_PORTION / 100;
+    spp->tlc_tt_lines = spp->tt_lines - spp->slc_tt_lines;
     check_params(spp);
 
     // 최종 설정된 정보 로그 출력

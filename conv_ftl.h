@@ -71,12 +71,10 @@ struct conv_ftl {
     struct convparams cp;       // FTL 파라미터 설정값
     struct ppa *maptbl; /* page level mapping table */         // 논리 주소(LPN) -> 물리 주소(PPA) 매핑 테이블
     uint64_t *rmap; /* reverse mapptbl, assume it's stored in OOB */ // 물리 주소 -> 논리 주소 역매핑 테이블 (GC시 사용, OOB 영역 가정)
-    struct write_pointer wp;    // 사용자 데이터 쓰기를 위한 포인터
     struct write_pointer slc_wp;
     struct write_pointer tlc_wp;
     struct write_pointer gc_wp; // GC 데이터(유효 페이지 이동) 쓰기를 위한 포인터
     struct write_pointer migration_wp;
-    struct line_mgmt lm;        // 라인(블록) 관리자
     struct line_mgmt slc_lm;
     struct line_mgmt tlc_lm;
     struct write_flow_control wfc; // 쓰기 유량 제어기

@@ -176,7 +176,7 @@ static_assert((ONESHOT_PAGE_SIZE % FLASH_PAGE_SIZE) == 0);
 // Plane당 SLC 블록 수 계산
 // (실제 적용은 FTL에서 분리 로직 필요)
 
-#define SLC_ONESHOT_PAGE_SIZE KB(32)
+#define SLC_ONESHOT_PAGE_SIZE KB(FLASH_PAGE_SIZE)
 // SLC 모드에서의 프로그램 단위
 // TLC(48KB)보다 작은 단위로 빠르게 기록
 

@@ -334,7 +334,7 @@ static void init_lines(struct conv_ftl *conv_ftl)
     struct line_mgmt *tlc_lm = &conv_ftl->tlc_lm;
 
     struct line *line;
-
+    //일단은 그냥 gc랑 migration 둘다 같은 정책쓸게요
     pqueue_cmp_pri_f cmp_func;
     pqueue_get_pri_f get_func;
 
@@ -342,7 +342,7 @@ static void init_lines(struct conv_ftl *conv_ftl)
     switch (gc_mode) {
     case GC_MODE_RANDOM:
         NVMEV_INFO("GC Strategy: RANDOM\n");
-        lm->select_victim = select_victim_random; // 함수 연결
+        tlc_lm->select_victim = select_victim_random; // 함수 연결
         // Random은 정렬이 필요 없으니 PQ 비교 함수는 아무거나(Greedy용) 넣어도 됨
         cmp_func = cmp_pri_dummy;
         get_func = get_pri_dummy;
@@ -350,7 +350,7 @@ static void init_lines(struct conv_ftl *conv_ftl)
 
     case GC_MODE_COST_BENEFIT:
         NVMEV_INFO("GC Strategy: COST-BENEFIT (Linear Scan)\n");
-        lm->select_victim = select_victim_cb; // 함수 연결
+        tlc_lm->select_victim = select_victim_cb; // 함수 연결
         cmp_func = cmp_pri_dummy; // CB도 스캔할 거면 PQ 정렬은 의미 없음
         get_func = get_pri_dummy;   
         break;
@@ -358,7 +358,7 @@ static void init_lines(struct conv_ftl *conv_ftl)
     case GC_MODE_GREEDY:
     default:
         NVMEV_INFO("GC Strategy: GREEDY\n");
-        lm->select_victim = select_victim_greedy; // 함수 연결
+        tlc_lm->select_victim = select_victim_greedy; // 함수 연결
         cmp_func = cmp_pri_greedy;
         get_func = get_pri_greedy;
         break;
@@ -367,23 +367,33 @@ static void init_lines(struct conv_ftl *conv_ftl)
     lm->tt_lines = spp->blks_per_pl; // 전체 라인 수 설정
     NVMEV_ASSERT(lm->tt_lines == spp->tt_lines); // 라인 수 검증
     lm->lines = vmalloc(sizeof(struct line) * lm->tt_lines); // 라인 구조체 배열 메모리 할당
+   
+    
+    if(conv_ftl->slc_enabled){
+        slc_lm->victim_line_pq = pqueue_init(slc_tt_lines, 
+                                                cmp_func, 
+                                                get_func,    
+                                                victim_line_set_pri,
+                                                victim_line_get_pos,
+                                                victim_line_set_pos);
+    }else{
+        tlc_tt_lines = lm->tt_lines;
+    }
 
-    INIT_LIST_HEAD(&lm->free_line_list); // 프리 라인 리스트 초기화
-    INIT_LIST_HEAD(&lm->full_line_list); // 풀(Full) 라인 리스트 초기화
 
     // 희생 라인 선정을 위한 우선순위 큐 초기화 (Greedy 정책 등 적용)
-    lm->victim_line_pq = pqueue_init(spp->tt_lines, 
+    tlc_lm->victim_line_pq = pqueue_init(tlc_tt_lines, 
                                         cmp_func, 
                                         get_func,    
                                         victim_line_set_pri,
                                         victim_line_get_pos,
                                         victim_line_set_pos);
 
-    lm->free_line_cnt = 0; // 프리 라인 카운트 초기화
     INIT_LIST_HEAD(&slc_lm->free_line_list);
     INIT_LIST_HEAD(&tlc_lm->free_line_list);
     slc_lm->free_line_cnt = 0;
     tlc_lm->free_line_cnt = 0;
+
     for (i = 0; i < lm->tt_lines; i++) { // 모든 라인에 대해 루프
         lm->lines[i] = (struct line){
             .id = i, // 라인 ID 설정
@@ -403,17 +413,20 @@ static void init_lines(struct conv_ftl *conv_ftl)
             list_add_tail(&lm->lines[i].entry, &tlc_lm->free_line_list);
             tlc_lm->free_line_cnt++;
         }
-        lm->free_line_cnt++;
     }
     if (conv_ftl->slc_enabled) {
         NVMEV_ASSERT(slc_lm->free_line_cnt + tlc_lm->free_line_cnt
                     == lm->tt_lines);
+        slc_lm->victim_line_cnt = 0; // 희생 후보 라인 수 0
+        slc_lm->full_line_cnt = 0; // 꽉 찬 라인 수 0
+        tlc_lm->victim_line_cnt = 0; // 희생 후보 라인 수 0
+        tlc_lm->full_line_cnt = 0; // 꽉 찬 라인 수 0
     } else {
         NVMEV_ASSERT(tlc_lm->free_line_cnt == lm->tt_lines);
+        tlc_lm->victim_line_cnt = 0; // 희생 후보 라인 수 0
+        tlc_lm->full_line_cnt = 0; // 꽉 찬 라인 수 0
     }
-    NVMEV_ASSERT(lm->free_line_cnt == lm->tt_lines); // 모든 라인이 프리 상태인지 확인
-    lm->victim_line_cnt = 0; // 희생 후보 라인 수 0
-    lm->full_line_cnt = 0; // 꽉 찬 라인 수 0
+    
 }
 
 // 라인 관련 메모리 해제 함수
@@ -444,9 +457,9 @@ static struct line *get_next_free_line(struct conv_ftl *conv_ftl, uint32_t io_ty
 {
     struct line_mgmt *lm;
     if (io_type == GC_IO) {
-        lm = &ftl->tlc_lm;                 // GC는 TLC 강제
+        lm = &conv_ftl->tlc_lm;                 // GC는 TLC 강제
     } else if (io_type == USER_IO) {
-        lm = ftl->slc_enabled ? &ftl->slc_lm : &ftl->tlc_lm;
+        lm = conv_ftl->slc_enabled ? &conv_ftl->slc_lm : &conv_ftl->tlc_lm;
     } else {
         NVMEV_ASSERT(0);
         return NULL;
@@ -509,9 +522,9 @@ static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
     struct ssdparams *spp = &conv_ftl->ssd->sp; // SSD 파라미터
     struct line_mgmt *lm;
     if(io_type == USER_IO){
-        lm = &conv_ftl->slc_enabled ? &conv_ftl->slc_lm : &conv_ftl->tlc_lm;
+        lm = conv_ftl->slc_enabled ? &conv_ftl->slc_lm : &conv_ftl->tlc_lm;
     }else if(io_type == GC_IO){
-        lm = conv_ftl->tlc_lm;
+        lm = &conv_ftl->tlc_lm;
     }else{
         NVMEV_ASSERT(0);
         return;
