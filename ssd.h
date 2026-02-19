@@ -197,10 +197,9 @@ struct ssdparams {
 
     int pgs_per_oneshotpg; /* 원샷 프로그램 단위 당 논리 페이지 수 */
     int slc_pgs_per_oneshotpg;
-    
     int oneshotpgs_per_blk; /* 블록 당 원샷 프로그램 수 */
     int slc_oneshotpgs_per_blk;
-
+    
     int pgs_per_blk; /* 블록 당 총 논리 페이지 수 */
     int blks_per_pl; /* 플레인 당 블록 수 */
     int slc_blks_per_pl;
