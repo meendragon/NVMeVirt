@@ -369,6 +369,7 @@ static void init_lines(struct conv_ftl *conv_ftl)
         NVMEV_ASSERT(slc_lm->tt_lines + tlc_lm->tt_lines == spp->tt_lines); // 라인 수 검증
         slc_lm->lines = vmalloc(sizeof(struct line) * slc_lm->tt_lines); // 라인 구조체 배열 메모리 할당
         tlc_lm->lines = vmalloc(sizeof(struct line) * tlc_lm->tt_lines);
+        slc_lm->select_victim = tlc_lm->select_victim;
         slc_lm->victim_line_pq = pqueue_init(slc_lm->tt_lines, 
                                             cmp_func, 
                                             get_func,    
@@ -386,13 +387,12 @@ static void init_lines(struct conv_ftl *conv_ftl)
                                         victim_line_set_pri,
                                         victim_line_get_pos,
                                         victim_line_set_pos);
-
     INIT_LIST_HEAD(&slc_lm->free_line_list);
     INIT_LIST_HEAD(&tlc_lm->free_line_list);
-
+    INIT_LIST_HEAD(&slc_lm->full_line_list);
+    INIT_LIST_HEAD(&tlc_lm->full_line_list);
     slc_lm->free_line_cnt = 0;
     tlc_lm->free_line_cnt = 0;
-
     for (i = 0; i < spp->tt_lines; i++) { // 모든 라인에 대해 루프
         if(conv_ftl->slc_enabled && i<slc_lm->tt_lines){
             slc_lm->lines[i] = (struct line){
@@ -403,8 +403,21 @@ static void init_lines(struct conv_ftl *conv_ftl)
                 .last_modified_time = 0,
                 .entry = LIST_HEAD_INIT(slc_lm->lines[i].entry), // 리스트 엔트리 초기화
             };
-            list_add_tail(&lm->lines[i].entry, &slc_lm->free_line_list);
+            list_add_tail(&slc_lm->lines[i].entry, &slc_lm->free_line_list);
             slc_lm->free_line_cnt++;
+        }else if(conv_ftl->slc_enabled){
+            int offset = slc_lm->tt_lines;
+            int t = i - offset;
+            tlc_lm->lines[t] = (struct line){
+                .id = i, // 라인 ID 설정
+                .ipc = 0, // 무효 페이지 수 0
+                .vpc = 0, // 유효 페이지 수 0
+                .pos = 0, // 큐 위치 0
+                .last_modified_time = 0, 
+                .entry = LIST_HEAD_INIT(tlc_lm->lines[t].entry), // 리스트 엔트리 초기화
+            };
+            list_add_tail(&tlc_lm->lines[t].entry, &tlc_lm->free_line_list);
+            tlc_lm->free_line_cnt++;
         }else{
             tlc_lm->lines[i] = (struct line){
                 .id = i, // 라인 ID 설정
@@ -414,19 +427,18 @@ static void init_lines(struct conv_ftl *conv_ftl)
                 .last_modified_time = 0, 
                 .entry = LIST_HEAD_INIT(tlc_lm->lines[i].entry), // 리스트 엔트리 초기화
             };
-            list_add_tail(&lm->lines[i].entry, &tlc_lm->free_line_list);
+            list_add_tail(&tlc_lm->lines[i].entry, &tlc_lm->free_line_list);
             tlc_lm->free_line_cnt++;
         }
     }
     if (conv_ftl->slc_enabled) {
-        NVMEV_ASSERT(slc_lm->free_line_cnt + tlc_lm->free_line_cnt
-                    == lm->tt_lines);
+        NVMEV_ASSERT(slc_lm->free_line_cnt + tlc_lm->free_line_cnt == spp->tt_lines);
         slc_lm->victim_line_cnt = 0; // 희생 후보 라인 수 0
         slc_lm->full_line_cnt = 0; // 꽉 찬 라인 수 0
         tlc_lm->victim_line_cnt = 0; // 희생 후보 라인 수 0
         tlc_lm->full_line_cnt = 0; // 꽉 찬 라인 수 0
     } else {
-        NVMEV_ASSERT(tlc_lm->free_line_cnt == lm->tt_lines); 
+        NVMEV_ASSERT(tlc_lm->free_line_cnt == spp->tt_lines);
         tlc_lm->victim_line_cnt = 0; // 희생 후보 라인 수 0
         tlc_lm->full_line_cnt = 0; // 꽉 찬 라인 수 0
     }
@@ -442,11 +454,14 @@ static void remove_lines(struct conv_ftl *conv_ftl)
 // 쓰기 유량 제어 초기화 함수
 static void init_write_flow_control(struct conv_ftl *conv_ftl)
 {
-    struct write_flow_control *wfc = &(conv_ftl->wfc); // 제어 구조체
+    struct write_flow_control *slc_wfc = &(conv_ftl->slc_wfc); // 제어 구조체
+    struct write_flow_control *tlc_wfc = &(conv_ftl->tlc_wfc);
     struct ssdparams *spp = &conv_ftl->ssd->sp; // 파라미터
 
-    wfc->write_credits = spp->pgs_per_line; // 초기 크레딧 설정 (한 라인 크기)
-    wfc->credits_to_refill = spp->pgs_per_line; // 리필 양 설정
+    slc_wfc->write_credits = spp->pgs_per_line; // 초기 크레딧 설정 (한 라인 크기)
+    tlc_wfc->write_credits = spp->pgs_per_line;
+    tlc_wfc->credits_to_refill = spp->pgs_per_line; // 리필 양 설정
+    tlc_wfc->credist_to_refill = spp->pgs_per_line;
 }
 
 // 주소 유효성 검사 함수
@@ -562,12 +577,6 @@ static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
     wpp->pg += spp->pgs_per_oneshotpg; // 다음 워드라인으로 페이지 이동
     if (wpp->pg != spp->pgs_per_blk) // 블록의 끝이 아니면
         goto out; // 종료
-
-    if(){
-        
-    }else{
-
-    }
     // 블록이 가득 찬 경우:
     wpp->pg = 0; // 페이지 0으로 리셋
     /* move current line to {victim,full} line list */
@@ -1147,29 +1156,91 @@ static void count_gc_victim_type(struct conv_ftl *conv_ftl, struct line *victim)
     }
 }
 // 실제 GC를 수행하는 메인 함수
-static int do_gc(struct conv_ftl *conv_ftl, bool force)
+static int do_migration(struct conv_ftl *conv_ftl, bool force)
 {
     struct line *victim_line = NULL;
     struct ssdparams *spp = &conv_ftl->ssd->sp;
     struct ppa ppa;
     int flashpg;
 
-
-    victim_line = conv_ftl->lm.select_victim(conv_ftl, force);
+    victim_line = conv_ftl->slc_lm.select_victim(conv_ftl, force);
     if (!victim_line) {
         return -1; // 선택 실패 시 리턴
     }
-    count_gc_victim_type(conv_ftl, victim_line);
-    
-    conv_ftl->gc_count++;
-    ppa.g.blk = victim_line->id;
+
     ppa.g.blk = victim_line->id; // 선택된 라인 ID를 블록 주소로 설정
     // GC 정보 디버그 출력
     NVMEV_DEBUG_VERBOSE("GC-ing line:%d,ipc=%d(%d),victim=%d,full=%d,free=%d\n", ppa.g.blk,
             victim_line->ipc, victim_line->vpc, conv_ftl->lm.victim_line_cnt,
             conv_ftl->lm.full_line_cnt, conv_ftl->lm.free_line_cnt);
 
-    conv_ftl->wfc.credits_to_refill = victim_line->ipc; // 회수된 공간만큼 크레딧 리필량 설정
+    conv_ftl->slc_wfc.credits_to_refill = victim_line->ipc; // 회수된 공간만큼 크레딧 리필량 설정
+
+    /* copy back valid data */
+    // 모든 플래시 페이지를 순회하며 유효 데이터 이동
+    for (flashpg = 0; flashpg < spp->flashpgs_per_blk; flashpg++) {
+        int ch, lun;
+
+        ppa.g.pg = flashpg * spp->pgs_per_flashpg;
+        for (ch = 0; ch < spp->nchs; ch++) { // 모든 채널 순회
+            for (lun = 0; lun < spp->luns_per_ch; lun++) { // 모든 LUN 순회
+                struct nand_lun *lunp;
+
+                ppa.g.ch = ch;
+                ppa.g.lun = lun;
+                ppa.g.pl = 0;
+                lunp = get_lun(conv_ftl->ssd, &ppa);
+                clean_one_flashpg(conv_ftl, &ppa); // 해당 페이지 청소(복사)
+
+                if (flashpg == (spp->flashpgs_per_blk - 1)) { // 마지막 페이지라면 (블록 비우기 완료)
+                    struct convparams *cpp = &conv_ftl->cp;
+
+                    mark_block_free(conv_ftl, &ppa); // 블록 상태를 Free로 변경 (메타데이터)
+
+                    if (cpp->enable_gc_delay) { // Erase 지연 시뮬레이션
+                        struct nand_cmd gce = {
+                            .type = GC_IO,
+                            .cmd = NAND_ERASE, // 지우기 명령
+                            .stime = 0,
+                            .interleave_pci_dma = false,
+                            .ppa = &ppa,
+                        };
+                        x(conv_ftl->ssd, &gce);
+                    }
+
+                    lunp->gc_endtime = lunp->next_lun_avail_time; // 시간 갱신
+                }
+            }
+        }
+    }
+
+    /* update line status */
+    mark_line_free(conv_ftl, &ppa); // 라인을 프리 리스트로 복귀
+
+    return 0;
+}
+// 실제 GC를 수행하는 메인 함수
+static int do_gc(struct conv_ftl *conv_ftl, bool force)
+{
+    struct line *victim_line = NULL;
+    struct ssdparams *spp = &conv_ftl->ssd->sp;
+    struct ppa ppa;
+    int flashpg;
+    
+    victim_line = conv_ftl->tlc_lm.select_victim(conv_ftl, force);
+    if (!victim_line) {
+        return -1; // 선택 실패 시 리턴
+    }
+    count_gc_victim_type(conv_ftl, victim_line);
+    
+    conv_ftl->gc_count++;
+    ppa.g.blk = victim_line->id; // 선택된 라인 ID를 블록 주소로 설정
+    // GC 정보 디버그 출력
+    NVMEV_DEBUG_VERBOSE("GC-ing line:%d,ipc=%d(%d),victim=%d,full=%d,free=%d\n", ppa.g.blk,
+            victim_line->ipc, victim_line->vpc, conv_ftl->lm.victim_line_cnt,
+            conv_ftl->lm.full_line_cnt, conv_ftl->lm.free_line_cnt);
+
+    conv_ftl->tlc_wfc.credits_to_refill = victim_line->ipc; // 회수된 공간만큼 크레딧 리필량 설정
 
     /* copy back valid data */
     // 모든 플래시 페이지를 순회하며 유효 데이터 이동

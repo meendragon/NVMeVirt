@@ -77,7 +77,8 @@ struct conv_ftl {
     struct write_pointer migration_wp;
     struct line_mgmt slc_lm;
     struct line_mgmt tlc_lm;
-    struct write_flow_control wfc; // 쓰기 유량 제어기
+    struct write_flow_control slc_wfc;
+    struct write_flow_control tlc_wfc; // 쓰기 유량 제어기
 
     uint64_t gc_count;              // 총 GC 수행 횟수
     uint64_t gc_copied_pages;       // GC로 복사된 총 페이지 수

@@ -132,7 +132,7 @@ void ssd_init_params(struct ssdparams *spp, uint64_t capacity, uint32_t nparts)
     spp->oneshotpgs_per_blk = DIV_ROUND_UP(blk_size, ONESHOT_PAGE_SIZE);
     spp->slc_oneshotpgs_per_blk = DIV_ROUND_UP(slc_blk_size, SLC_ONESHOT_PAGE_SIZE);
 
-    spp->pgs_per_flashpg = FLASH_PAGE_SIZE / (spp->pgsz);
+    spp->pgs_per_flashpg = FLASH_PAGE_SIZE / (spp->pgsz); 
     spp->flashpgs_per_blk = (ONESHOT_PAGE_SIZE / FLASH_PAGE_SIZE) * spp->oneshotpgs_per_blk;
 
     
