@@ -231,7 +231,7 @@ static_assert((ONESHOT_PAGE_SIZE % FLASH_PAGE_SIZE) == 0);
 #define NAND_CHANNELS (8)
 #define LUNS_PER_NAND_CH (16)
 #define FLASH_PAGE_SIZE KB(64)
-#define PLNS_PER_LUN (1) /* not used*/
+#define PLNS_PER_LUN (1) /* not used single plane in die(lun)*/
 #define DIES_PER_ZONE (1)
 
 #if 0

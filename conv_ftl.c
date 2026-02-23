@@ -41,14 +41,14 @@ static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *pp
 static bool should_gc(struct conv_ftl *conv_ftl)
 {
     // 현재 남은 프리 라인(Free Line) 개수가 GC 시작 임계값 이하인지 확인
-    return (conv_ftl->lm.free_line_cnt <= conv_ftl->cp.gc_thres_lines);
+    return (conv_ftl->tlc_lm.free_line_cnt <= conv_ftl->cp.gc_thres_lines);
 }
 
 // 긴급 GC가 필요한지 확인하는 함수 (높은 임계값)
 static inline bool should_gc_high(struct conv_ftl *conv_ftl)
 {
     // 프리 라인이 매우 부족한 상황인지 확인 (Foreground GC 트리거 용)
-    return conv_ftl->lm.free_line_cnt <= conv_ftl->cp.gc_thres_lines_high;
+    return conv_ftl->tlc_lm.free_line_cnt <= conv_ftl->cp.gc_thres_lines_high;
 }
 
 // 매핑 테이블에서 LPN(논리 페이지 번호)에 해당하는 PPA(물리 주소)를 가져오는 함수
@@ -157,7 +157,7 @@ static struct line *select_victim_greedy(struct conv_ftl *conv_ftl, bool force)
 {
 
     struct ssdparams *spp = &conv_ftl->ssd->sp;
-    struct line_mgmt *lm = &conv_ftl->lm;
+    struct line_mgmt *lm = &conv_ftl->tlc_lm;
     struct line *victim_line = pqueue_peek(lm->victim_line_pq); // 1등 확인
 
     if (!victim_line) return NULL;
@@ -181,7 +181,7 @@ static struct line *select_victim_random(struct conv_ftl *conv_ftl, bool force)
 {
 
     struct ssdparams *spp = &conv_ftl->ssd->sp;
-    struct line_mgmt *lm = &conv_ftl->lm;
+    struct line_mgmt *lm = &conv_ftl->tlc_lm;
     pqueue_t *q = lm->victim_line_pq;   //pqueue를 그대로 가져옴 원본을
     
     if (q->size == 0) return NULL; // 비어있으면 종료
@@ -257,7 +257,7 @@ static struct line *select_victim_cb(struct conv_ftl *conv_ftl, bool force)
 
     struct ssdparams *spp = &conv_ftl->ssd->sp;
     // 1. 편의를 위해 긴 구조체 경로를 짧은 변수명(lm)으로 할당
-    struct line_mgmt *lm = &conv_ftl->lm;
+    struct line_mgmt *lm = &conv_ftl->tlc_lm;
     // 2. 우선순위 큐 구조체 포인터 가져오기
     pqueue_t *q = lm->victim_line_pq;
     // 3. 현재까지 찾은 '최고의 희생양'을 저장할 포인터 초기화
@@ -447,8 +447,12 @@ static void init_lines(struct conv_ftl *conv_ftl)
 // 라인 관련 메모리 해제 함수
 static void remove_lines(struct conv_ftl *conv_ftl)
 {
-    pqueue_free(conv_ftl->lm.victim_line_pq); // 우선순위 큐 해제
-    vfree(conv_ftl->lm.lines); // 라인 구조체 배열 해제
+    pqueue_free(conv_ftl->tlc_lm.victim_line_pq); // 우선순위 큐 해제
+    vfree(conv_ftl->tlc_lm.lines); // 라인 구조체 배열 해제
+    if(conv_ftl->slc_enabled){
+        pqueue_free(conv_ftl->slc_lm.victim_line_pq);
+        vfree(conv_ftl->slc_lm.lines);
+    }
 }
 
 // 쓰기 유량 제어 초기화 함수
@@ -845,7 +849,7 @@ static inline bool mapped_ppa(struct ppa *ppa)
 // PPA에 해당하는 라인(블록) 포인터를 가져오는 함수
 static inline struct line *get_line(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
-    return &(conv_ftl->lm.lines[ppa->g.blk]); // 블록 인덱스를 이용해 라인 반환
+    return &(conv_ftl->tlc_lm.lines[ppa->g.blk]); // 블록 인덱스를 이용해 라인 반환
 }
 
 /* update SSD status about one page from PG_VALID -> PG_VALID */
@@ -853,7 +857,6 @@ static inline struct line *get_line(struct conv_ftl *conv_ftl, struct ppa *ppa)
 static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
     struct ssdparams *spp = &conv_ftl->ssd->sp; // 파라미터
-    struct line_mgmt *lm = &conv_ftl->lm; // 라인 관리자
     struct nand_block *blk = NULL;
     struct nand_page *pg = NULL;
     bool was_full_line = false;
@@ -873,6 +876,12 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 
     /* update corresponding line status */
     line = get_line(conv_ftl, ppa); // 라인 가져오기
+    struct line_mgmt *lm;
+    if(conv_ftl->slc_enabled && line->id < conv_ftl->slc_lm.tt_lines){
+        lm = &conv_ftl->slc_lm;
+    }else{
+        lm = &conv_ftl->tlc_lm;
+    }
     NVMEV_ASSERT(line->ipc >= 0 && line->ipc < spp->pgs_per_line);
     if (line->vpc == spp->pgs_per_line) { // 기존에 꽉 찬 라인(Full Line)이었다면
         NVMEV_ASSERT(line->ipc == 0);
@@ -1237,8 +1246,8 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
     ppa.g.blk = victim_line->id; // 선택된 라인 ID를 블록 주소로 설정
     // GC 정보 디버그 출력
     NVMEV_DEBUG_VERBOSE("GC-ing line:%d,ipc=%d(%d),victim=%d,full=%d,free=%d\n", ppa.g.blk,
-            victim_line->ipc, victim_line->vpc, conv_ftl->lm.victim_line_cnt,
-            conv_ftl->lm.full_line_cnt, conv_ftl->lm.free_line_cnt);
+            victim_line->ipc, victim_line->vpc, conv_ftl->tlc_lm.victim_line_cnt,
+            conv_ftl->tlc_lm.full_line_cnt, conv_ftl->tlc_lm.free_line_cnt);
 
     conv_ftl->tlc_wfc.credits_to_refill = victim_line->ipc; // 회수된 공간만큼 크레딧 리필량 설정
 

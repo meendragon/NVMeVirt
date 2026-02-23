@@ -194,6 +194,7 @@ struct ssdparams {
     
     int pgs_per_flashpg; /* 물리 페이지(Flash Page) 당 논리 페이지(4KB) 수 */
     int flashpgs_per_blk; /* 블록 당 물리 페이지 수 */
+    int slc_flashpgs_per_blk;
 
     int pgs_per_oneshotpg; /* 원샷 프로그램 단위 당 논리 페이지 수 */
     int slc_pgs_per_oneshotpg;
@@ -201,6 +202,7 @@ struct ssdparams {
     int slc_oneshotpgs_per_blk;
     
     int pgs_per_blk; /* 블록 당 총 논리 페이지 수 */
+    int slc_pgs_per_blk;
     int blks_per_pl; /* 플레인 당 블록 수 */
     int slc_blks_per_pl;
     int pls_per_lun; /* LUN 당 플레인 수 */
@@ -237,27 +239,41 @@ struct ssdparams {
 
     /* [계산된 총계 값들 (Total Counts)] - 초기화 시 자동 계산됨 */
     unsigned long secs_per_blk;
+    unsigned long slc_secs_per_blk;
     unsigned long secs_per_pl;
+    unsigned long slc_secs_per_pl;
     unsigned long secs_per_lun;
+    unsigned long slc_secs_per_lun;
     unsigned long secs_per_ch;
+    unsigned long slc_secs_per_ch;
     unsigned long tt_secs; /* SSD 전체 섹터 수 */
+    unsigned long slc_tt_secs;
+    unsigned long tlc_tt_secs;
 
     unsigned long pgs_per_pl;
+    unsigned long slc_pgs_per_pl;
     unsigned long pgs_per_lun;
+    unsigned long slc_pgs_per_pl;
     unsigned long pgs_per_ch;
+    unsigned long slc_pgs_per_ch;
     unsigned long tt_pgs; /* SSD 전체 페이지 수 */
+    unsigned long slc_tt_pgs;
+    unsigned long tlc_tt_pgs;
 
     unsigned long blks_per_lun;
     unsigned long blks_per_ch;
     unsigned long tt_blks; /* SSD 전체 블록 수 */
 
+
     unsigned long secs_per_line;
+    unsigned long slc_secs_per_line;
     unsigned long pgs_per_line;
+    unsigned long slc_pgs_per_line;
     unsigned long blks_per_line;
     
     unsigned long tt_lines; /* 전체 라인(Superblock) 수 */
-    unsigned long slc_tt_lines;
-    unsigned long tlc_tt_lines;
+    unsigned long slc_tt_lines; //slc 라인수
+    unsigned long tlc_tt_lines; //tlc 라인수
 
     unsigned long pls_per_ch;
     unsigned long tt_pls;

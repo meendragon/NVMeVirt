@@ -85,17 +85,17 @@ static void check_params(struct ssdparams *spp)
 // ========================================================
 void ssd_init_params(struct ssdparams *spp, uint64_t capacity, uint32_t nparts)
 {
-    uint64_t blk_size,slc_blk_size,total_size;
+    uint64_t blk_size,total_size;
 
     // 섹터 및 페이지 크기 설정
     spp->secsz = LBA_SIZE;              // 보통 512B
-    spp->secs_per_pg = 4096 / LBA_SIZE; // 4KB 페이지 기준 섹터 수 (보통 8개)
+    spp->secs_per_pg = 4096 / LBA_SIZE; // 1페이지를 4키로바이트로 잡고 몇개의 섹터가잇는지
     spp->pgsz = spp->secsz * spp->secs_per_pg; // 페이지 크기 (4KB)
 
     // 채널 및 낸드 구조 설정
-    spp->nchs = NAND_CHANNELS;
-    spp->pls_per_lun = PLNS_PER_LUN;
-    spp->luns_per_ch = LUNS_PER_NAND_CH;
+    spp->nchs = NAND_CHANNELS; //낸드의 채널 개수 8로 되어잇기는함
+    spp->pls_per_lun = PLNS_PER_LUN; //다이당 플레인수 여기는 싱글플레인임
+    spp->luns_per_ch = LUNS_PER_NAND_CH; //채널당 lun개수 채널이 8개고 이게 16이면 128개의 낸드 lun이 있다.
     spp->cell_mode = CELL_MODE; // SLC/MLC/TLC 등
 
     /* 파티셔닝: 여러 개의 FTL 인스턴스가 병렬로 돌아가도록 채널을 나눔 */
@@ -110,8 +110,6 @@ void ssd_init_params(struct ssdparams *spp, uint64_t capacity, uint32_t nparts)
         spp->slc_blks_per_pl = SLC_BLKS;
         // 용량을 역산하여 블록 크기 추정
         blk_size = DIV_ROUND_UP(capacity, spp->blks_per_pl * spp->pls_per_lun *
-                              spp->luns_per_ch * spp->nchs);
-        slc_blk_size = DIV_ROUND_UP(capacity, spp->slc_blks_per_pl * spp->pls_per_lun *
                               spp->luns_per_ch * spp->nchs);
     } else {
         // 블록 크기가 명시된 경우 (보통 ZNS 등)
@@ -128,16 +126,21 @@ void ssd_init_params(struct ssdparams *spp, uint64_t capacity, uint32_t nparts)
 
     // 내부 관리 단위 계산
     spp->pgs_per_oneshotpg = ONESHOT_PAGE_SIZE / (spp->pgsz); // 원샷 당 4KB 페이지 수
+    //48키로바이트를 4키로바이트로 나눳으니 위의 값은 12일것이며 이것은 페이지 수다 원샷당
     spp->slc_pgs_per_oneshotpg = SLC_ONESHOT_PAGE_SIZE / (spp->pgsz);
+    //16키로바이트를 4키로바이트로 나눳으니 SLC 값은 역시나 4일것이며 이것은 slc 원샷 페이지 양
     spp->oneshotpgs_per_blk = DIV_ROUND_UP(blk_size, ONESHOT_PAGE_SIZE);
-    spp->slc_oneshotpgs_per_blk = DIV_ROUND_UP(slc_blk_size, SLC_ONESHOT_PAGE_SIZE);
+    spp->slc_oneshotpgs_per_blk = DIV_ROUND_UP(blk_size, SLC_ONESHOT_PAGE_SIZE);
 
     spp->pgs_per_flashpg = FLASH_PAGE_SIZE / (spp->pgsz); 
-    spp->flashpgs_per_blk = (ONESHOT_PAGE_SIZE / FLASH_PAGE_SIZE) * spp->oneshotpgs_per_blk;
 
+    spp->flashpgs_per_blk = (ONESHOT_PAGE_SIZE / FLASH_PAGE_SIZE) * spp->oneshotpgs_per_blk;
+    spp->slc_flashpgs_per_blk = (SLC_ONESHOT_PAGE_SIZE / FLASH_PAGE_SIZE) * spp->slc_oneshotpgs_per_blk;
     
 
     spp->pgs_per_blk = spp->pgs_per_oneshotpg * spp->oneshotpgs_per_blk; // 블록 당 총 페이지 수
+    spp->slc_pgs_per_blk = spp->slc_pgs_per_oneshotpg * spp->slc_oneshotpgs_per_blk; // 블록 당 총 페이지 수
+
 
     spp->write_unit_size = WRITE_UNIT_SIZE;
 
@@ -178,15 +181,33 @@ void ssd_init_params(struct ssdparams *spp, uint64_t capacity, uint32_t nparts)
 
     /* 주소 변환을 위한 총계 계산 (Total Counts) */
     spp->secs_per_blk = spp->secs_per_pg * spp->pgs_per_blk;
+    spp->slc_secs_per_blk = spp->secs_per_pg * spp->slc_pgs_per_blk;
+
     spp->secs_per_pl = spp->secs_per_blk * spp->blks_per_pl;
+    spp->slc_secs_per_pl = spp->slc_secs_per_blk * spp->blks_per_pl;
+    
     spp->secs_per_lun = spp->secs_per_pl * spp->pls_per_lun;
+    spp->slc_secs_per_lun = spp->slc_secs_per_pl * spp->pls_per_lun;
+
     spp->secs_per_ch = spp->secs_per_lun * spp->luns_per_ch;
+    spp->secs_per_ch = spp->slc_secs_per_lun * spp->luns_per_ch;
+
     spp->tt_secs = spp->secs_per_ch * spp->nchs; // 전체 섹터 수
+    spp->slc_tt_secs = spp->tt_secs * SLC_PORTION / 100;
+    spp->tlc_tt_secs = spp->tt_secs - spp->slc_tt_secs;
 
     spp->pgs_per_pl = spp->pgs_per_blk * spp->blks_per_pl;
+    spp->slc_pgs_per_pl = spp->slc_pgs_per_blk * spp->blks_per_pl;
+
     spp->pgs_per_lun = spp->pgs_per_pl * spp->pls_per_lun;
+    spp->slc_pgs_per_lun = spp->slc_pgs_per_pl * spp->pls_per_lun;
+
     spp->pgs_per_ch = spp->pgs_per_lun * spp->luns_per_ch;
+    spp->slc_pgs_per_ch = spp->slc_pgs_per_lun * spp->luns_per_ch;
+
     spp->tt_pgs = spp->pgs_per_ch * spp->nchs; // 전체 페이지 수
+    spp->slc_tt_pgs = spp->tt_pgs * SLC_PORTION / 100;
+    spp->tlc_tt_pgs = spp->tt_pgs - spp->slc_tt_pgs;
 
     spp->blks_per_lun = spp->blks_per_pl * spp->pls_per_lun;
     spp->blks_per_ch = spp->blks_per_lun * spp->luns_per_ch;
@@ -199,8 +220,13 @@ void ssd_init_params(struct ssdparams *spp, uint64_t capacity, uint32_t nparts)
 
     /* 슈퍼블록(Line)은 모든 채널/LUN을 묶은 단위 */
     spp->blks_per_line = spp->tt_luns; 
+
     spp->pgs_per_line = spp->blks_per_line * spp->pgs_per_blk;
+    spp->slc_pgs_per_line = spp->blks_per_line * spp->slc_pgs_per_blk;
+
     spp->secs_per_line = spp->pgs_per_line * spp->secs_per_pg;
+    spp->slc_secs_per_line = spp->slc_pgs_per_line * spp->secs_per_pg;
+    
     spp->tt_lines = spp->blks_per_lun; // 라인 개수 = LUN당 블록 수
     spp->slc_tt_lines = spp->tt_lines * SLC_PORTION / 100;
     spp->tlc_tt_lines = spp->tt_lines - spp->slc_tt_lines;
