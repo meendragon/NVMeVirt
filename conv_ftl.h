@@ -14,10 +14,16 @@ typedef struct line *(*victim_select_fn)(struct conv_ftl *, bool);
 struct convparams {
     uint32_t gc_thres_lines;      // GC를 시작할 프리 라인 개수 임계값 (이보다 적으면 GC 시작)
     uint32_t gc_thres_lines_high; // 긴급 GC(Foreground GC)를 수행할 임계값
+    
+    uint32_t mg_thres_lines;
+    uint32_t mg_thres_lines_high;
+
     bool enable_gc_delay;         // GC 수행 시 발생하는 지연(Latency) 시뮬레이션 활성화 여부
+    bool enable_mg_delay;
 
     double op_area_pcent;         // 오버 프로비저닝(Over-Provisioning) 영역 비율
     int pba_pcent; /* (physical space / logical space) * 100*/ // 물리 공간 대비 논리 공간의 비율 (OP 포함)
+    int slc_pba_pcent;
 };
 
 // 하나의 '라인(Line)' 즉, 슈퍼블록(Superblock)을 관리하는 구조체

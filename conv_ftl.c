@@ -30,13 +30,31 @@ static uint64_t victim_chosen_cnt = 0;
 /* ==================================== ===================== */
 
 // 현재 페이지가 워드라인(Wordline)의 마지막 페이지인지 확인하는 함수
-static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *ppa)
+static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *ppa, uint32_t io_type)
 {
     struct ssdparams *spp = &conv_ftl->ssd->sp; // SSD 파라미터 가져오기
     // 현재 페이지 번호가 원샷(One-shot) 프로그래밍 단위의 끝인지 계산
-    return (ppa->g.pg % spp->pgs_per_oneshotpg) == (spp->pgs_per_oneshotpg - 1);
+    int pgs_per_oneshot;
+    if (io_type == USER_IO && conv_ftl->slc_enabled){
+        pgs_per_oneshot = spp->slc_pgs_per_oneshotpg;
+    }else{
+        pgs_per_oneshot = spp->pgs_per_oneshotpg;
+    }
+    return (ppa->g.pg % pgs_per_oneshot) == (pgs_per_oneshot - 1);
+}
+// 마이그레이션이 필요한지 확인하는 함수 (기본 임계값)
+static bool should_mg(struct conv_ftl *conv_ftl)
+{
+    // 현재 남은 프리 라인(Free Line) 개수가 GC 시작 임계값 이하인지 확인
+    return (conv_ftl->slc_lm.free_line_cnt <= conv_ftl->cp.mg_thres_lines);
 }
 
+// 긴급 마이그레이션이 필요한지 확인하는 함수 (높은 임계값)
+static inline bool should_mg_high(struct conv_ftl *conv_ftl)
+{
+    // 프리 라인이 매우 부족한 상황인지 확인 (Foreground GC 트리거 용)
+    return conv_ftl->slc_lm.free_line_cnt <= conv_ftl->cp.mg_thres_lines_high;
+}
 // 가비지 컬렉션(GC)이 필요한지 확인하는 함수 (기본 임계값)
 static bool should_gc(struct conv_ftl *conv_ftl)
 {
@@ -131,23 +149,40 @@ static inline void victim_line_set_pos(void *a, size_t pos)
 // 쓰기 크레딧(Write Credit)을 하나 소모하는 함수
 static inline void consume_write_credit(struct conv_ftl *conv_ftl)
 {
-    conv_ftl->wfc.write_credits--; // 크레딧 감소 (쓰기 허용량 차감)
+    if(conv_ftl->slc_enabled){
+        conv_ftl->slc_wfc.write_credits--; // 크레딧 감소 (쓰기 허용량 차감)
+    } else{
+        conv_ftl->tlc_wfc.write_credits--;
+    }
+    
 }
 
 // 전경(Foreground) GC 함수 선언
 static void foreground_gc(struct conv_ftl *conv_ftl);
-
+// 전경(Foreground) GC 함수 선언
+static void foreground_gc(struct conv_ftl *conv_ftl);
 // 쓰기 크레딧을 확인하고 부족하면 GC를 수행해 채우는 함수
 
 
 static inline void check_and_refill_write_credit(struct conv_ftl *conv_ftl)
 {
-    struct write_flow_control *wfc = &(conv_ftl->wfc); // 유량 제어 구조체
-    if (wfc->write_credits <= 0) { // 크레딧이 바닥나면
-        foreground_gc(conv_ftl); // 강제로 GC 수행 (공간 확보)
-
-        wfc->write_credits += wfc->credits_to_refill; // 크레딧 리필
+    struct write_flow_control *wfc;
+    if(conv_ftl->slc_enabled){
+        wfc = &(conv_ftl->slc_wfc);
+        if(wfc->write_credits <= 0){
+            foreground_mg(conv_ftl);
+            wfc->write_credits += wfc->credits_to_refill;
+        }
+    }else{
+        wfc = &(conv_ftl->tlc_wfc);
+        if (wfc->write_credits <= 0) { // 크레딧이 바닥나면
+            foreground_gc(conv_ftl); // 강제로 GC 수행 (공간 확보)
+            wfc->write_credits += wfc->credits_to_refill; // 크레딧 리필
+        }
     }
+
+
+    
 }
 
 // ---------------------------------------------------------
@@ -462,10 +497,10 @@ static void init_write_flow_control(struct conv_ftl *conv_ftl)
     struct write_flow_control *tlc_wfc = &(conv_ftl->tlc_wfc);
     struct ssdparams *spp = &conv_ftl->ssd->sp; // 파라미터
 
-    slc_wfc->write_credits = spp->pgs_per_line; // 초기 크레딧 설정 (한 라인 크기)
+    slc_wfc->write_credits = spp->slc_pgs_per_line; // 초기 크레딧 설정 (한 라인 크기)
     tlc_wfc->write_credits = spp->pgs_per_line;
-    tlc_wfc->credits_to_refill = spp->pgs_per_line; // 리필 양 설정
-    tlc_wfc->credist_to_refill = spp->pgs_per_line;
+    slc_wfc->credits_to_refill = spp->slc_pgs_per_line; // 리필 양 설정
+    tlc_wfc->credits_to_refill = spp->pgs_per_line;
 }
 
 // 주소 유효성 검사 함수
@@ -488,7 +523,14 @@ static struct line *get_next_free_line(struct conv_ftl *conv_ftl, uint32_t io_ty
     }
     
     struct line *curline = list_first_entry_or_null(&lm->free_line_list,struct line, entry);
- 
+    if (io_type == USER_IO) {
+        pr_info_ratelimited("nvmev: USER alloc line_id=%d from %s (slc_enabled=%d) slc_free=%d tlc_free=%d\n",
+                            curline->id,
+                            (lm == &conv_ftl->slc_lm) ? "SLC" : "TLC",
+                            conv_ftl->slc_enabled,
+                            conv_ftl->slc_lm.free_line_cnt,
+                            conv_ftl->tlc_lm.free_line_cnt);
+    }
     if (!curline) {
         NVMEV_ERROR("No free line left in VIRT (%s)!!!!\n",
                     conv_ftl->slc_enabled ? "SLC" : "TLC");
@@ -548,7 +590,8 @@ static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
     }else if(io_type == GC_IO){
         //migration시에도 
         lm = &conv_ftl->tlc_lm;
-    }else{
+    }
+    else{ 
         NVMEV_ASSERT(0);
         return;
     }
@@ -558,12 +601,24 @@ static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
     NVMEV_DEBUG_VERBOSE("current wpp: ch:%d, lun:%d, pl:%d, blk:%d, pg:%d\n",
             wpp->ch, wpp->lun, wpp->pl, wpp->blk, wpp->pg);
 
-    check_addr(wpp->pg, spp->pgs_per_blk); // 페이지 주소 검사
+    int pgs_per_blk, pgs_per_oneshotpg, pgs_per_line;
+    if(io_type == USER_IO && conv_ftl->slc_enabled){
+        pgs_per_blk = spp->slc_pgs_per_blk;
+        pgs_per_oneshotpg = spp->slc_pgs_per_oneshotpg;
+        pgs_per_line = spp -> slc_pgs_per_line;
+    }else{
+        pgs_per_blk = spp->pgs_per_blk;
+        pgs_per_oneshotpg = spp->pgs_per_oneshotpg;
+        pgs_per_line = spp -> pgs_per_line;
+    }
+
+
+    check_addr(wpp->pg, pgs_per_blk); // 페이지 주소 검사
     wpp->pg++; // 페이지 번호 증가
-    if ((wpp->pg % spp->pgs_per_oneshotpg) != 0) // 원샷 프로그램 단위 안이면
+    if ((wpp->pg % pgs_per_oneshotpg) != 0) // 원샷 프로그램 단위 안이면
         goto out; // 단순히 페이지만 증가시키고 종료
 
-    wpp->pg -= spp->pgs_per_oneshotpg; // 페이지 번호 조정
+    wpp->pg -= pgs_per_oneshotpg; // 페이지 번호 조정
     check_addr(wpp->ch, spp->nchs); // 채널 주소 검사
     wpp->ch++; // 채널 번호 증가 (채널 인터리빙)
     if (wpp->ch != spp->nchs) // 마지막 채널이 아니면
@@ -578,13 +633,13 @@ static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 
     wpp->lun = 0; // LUN 0으로 리셋
     /* go to next wordline in the block */
-    wpp->pg += spp->pgs_per_oneshotpg; // 다음 워드라인으로 페이지 이동
-    if (wpp->pg != spp->pgs_per_blk) // 블록의 끝이 아니면
+    wpp->pg += pgs_per_oneshotpg; // 다음 워드라인으로 페이지 이동
+    if (wpp->pg != pgs_per_blk) // 블록의 끝이 아니면
         goto out; // 종료
     // 블록이 가득 찬 경우:
     wpp->pg = 0; // 페이지 0으로 리셋
     /* move current line to {victim,full} line list */
-    if (wpp->curline->vpc == spp->pgs_per_line) { // 모든 페이지가 유효하면 (Full)
+    if (wpp->curline->vpc == pgs_per_line) { // 모든 페이지가 유효하면 (Full)
         /* all pgs are still valid, move to full line list */
         NVMEV_ASSERT(wpp->curline->ipc == 0); // 무효 페이지는 0이어야 함
         list_add_tail(&wpp->curline->entry, &lm->full_line_list); // 풀 라인 리스트로 이동
@@ -592,7 +647,7 @@ static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
         NVMEV_DEBUG_VERBOSE("wpp: move line to full_line_list\n");
     } else { // 무효 페이지가 섞여있으면 (Victim 후보)
         NVMEV_DEBUG_VERBOSE("wpp: line is moved to victim list\n");
-        NVMEV_ASSERT(wpp->curline->vpc >= 0 && wpp->curline->vpc < spp->pgs_per_line);
+        NVMEV_ASSERT(wpp->curline->vpc >= 0 && wpp->curline->vpc < pgs_per_line);
         /* there must be some invalid pages in this line */
         NVMEV_ASSERT(wpp->curline->ipc > 0); // 무효 페이지가 반드시 존재해야 함
         pqueue_insert(lm->victim_line_pq, wpp->curline); // 희생 라인 우선순위 큐에 삽입
@@ -633,7 +688,10 @@ static struct ppa get_new_page(struct conv_ftl *conv_ftl, uint32_t io_type)
     ppa.g.pl = wp->pl; // 현재 플레인
 
     NVMEV_ASSERT(ppa.g.pl == 0); // 플레인은 0이어야 함 (단일 플레인 가정)
-
+    pr_debug_ratelimited("nvmev: new ppa blk(line)=%d io=%s slc=%d\n",
+                     ppa.g.blk,
+                     (io_type == USER_IO) ? "USER" : "GC",
+                     conv_ftl->slc_enabled);
     return ppa; // 생성된 PPA 반환
 }
 
@@ -674,7 +732,7 @@ static void remove_rmap(struct conv_ftl *conv_ftl)
 }
 
 // FTL 인스턴스 초기화 함수
-static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, struct ssd *ssd)
+static void conv_init_ftl(struct conv_ftl *conv_ftl, struct q *cpp, struct ssd *ssd)
 {
     struct ssdparams *spp = &ssd->sp;
     /*copy convparams*/
@@ -707,6 +765,9 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
     // 초기화 완료 로그 출력
     NVMEV_INFO("Init FTL instance with %d channels (%ld pages)\n", conv_ftl->ssd->sp.nchs,
            conv_ftl->ssd->sp.tt_pgs);
+    NVMEV_INFO("SLC: slc_buf=%d slc_enabled=%d slc_lines=%d tlc_lines=%d\n",
+           slc_buf, conv_ftl->slc_enabled,
+           conv_ftl->slc_lm.tt_lines, conv_ftl->tlc_lm.tt_lines);
 
     return;
 }
@@ -726,7 +787,13 @@ static void conv_init_params(struct convparams *cpp)
     cpp->gc_thres_lines = 2; /* Need only two lines.(host write, gc)*/ // GC 시작 임계값 (최소 2개)
     cpp->gc_thres_lines_high = 2; /* Need only two lines.(host write, gc)*/ // 긴급 GC 임계값
     cpp->enable_gc_delay = 1; // GC 지연 시뮬레이션 활성화
+    
+    cpp->mg_thres_lines = 2;
+    cpp->mg_thres_lines_high = 2;
+    cpp->enable_mg_delay = 1;
+    
     cpp->pba_pcent = (int)((1 + cpp->op_area_pcent) * 100); // 물리 공간 비율 계산
+    cpp->slc_pba_pcent = (int)((1 + cpp->op_area_pcent) * 100 * SLC_PORTION / 100);
 }
 
 // 네임스페이스(NVMe Namespace) 초기화 함수
@@ -849,7 +916,13 @@ static inline bool mapped_ppa(struct ppa *ppa)
 // PPA에 해당하는 라인(블록) 포인터를 가져오는 함수
 static inline struct line *get_line(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
-    return &(conv_ftl->tlc_lm.lines[ppa->g.blk]); // 블록 인덱스를 이용해 라인 반환
+    int line_id = ppa->g.blk; // 너 구조에선 blk==line_id로 쓰고 있음
+    if (conv_ftl->slc_enabled && line_id < conv_ftl->slc_lm.tt_lines) {
+        return &conv_ftl->slc_lm.lines[line_id];
+    } else {
+        int off = conv_ftl->slc_enabled ? conv_ftl->slc_lm.tt_lines : 0;
+        return &conv_ftl->tlc_lm.lines[line_id - off];
+    }
 }
 
 /* update SSD status about one page from PG_VALID -> PG_VALID */
@@ -983,6 +1056,8 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 
     NVMEV_ASSERT(valid_lpn(conv_ftl, lpn)); // LPN 유효성 확인
     new_ppa = get_new_page(conv_ftl, GC_IO); // GC용 새 페이지(Open Block) 할당
+    pr_info_ratelimited("nvmev: GC new_ppa blk=%d (should be TLC area) slc_tt=%d\n",
+                    new_ppa.g.blk, conv_ftl->slc_lm.tt_lines);
     /* update maptbl */
     set_maptbl_ent(conv_ftl, lpn, &new_ppa); // 매핑 테이블을 새 주소로 갱신
     /* update rmap */
@@ -1003,7 +1078,7 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
             .interleave_pci_dma = false,
             .ppa = &new_ppa,
         };
-        if (last_pg_in_wordline(conv_ftl, &new_ppa)) { // 워드라인 끝이면 실제 쓰기 명령 수행
+        if (last_pg_in_wordline(conv_ftl, &new_ppa,GC_IO)) { // 워드라인 끝이면 실제 쓰기 명령 수행
             gcw.cmd = NAND_WRITE;
             gcw.xfer_size = spp->pgsz * spp->pgs_per_oneshotpg;
         }
@@ -1092,7 +1167,6 @@ static void clean_one_flashpg(struct conv_ftl *conv_ftl, struct ppa *ppa)
         if (pg_iter->status == PG_VALID) {
             /* delay the maptbl update until "write" happens */
             gc_write_page(conv_ftl, &ppa_copy); // 유효 페이지 복사 해당연산이 코스트에 해당한다고 볼 수 있기 때문에
-
         }
 
         ppa_copy.g.pg++;
@@ -1100,9 +1174,8 @@ static void clean_one_flashpg(struct conv_ftl *conv_ftl, struct ppa *ppa)
 }
 
 // GC가 끝난 라인을 프리 라인 리스트로 되돌리는 함수
-static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
+static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa, struct line_mgmt *lm)
 {
-    struct line_mgmt *lm = &conv_ftl->lm;
     struct line *line = get_line(conv_ftl, ppa); // 라인 가져오기
     line->ipc = 0; // 무효 카운트 초기화
     line->vpc = 0; // 유효 카운트 초기화
@@ -1165,7 +1238,7 @@ static void count_gc_victim_type(struct conv_ftl *conv_ftl, struct line *victim)
     }
 }
 // 실제 GC를 수행하는 메인 함수
-static int do_migration(struct conv_ftl *conv_ftl, bool force)
+static int do_mg(struct conv_ftl *conv_ftl, bool force)
 {
     struct line *victim_line = NULL;
     struct ssdparams *spp = &conv_ftl->ssd->sp;
@@ -1180,10 +1253,10 @@ static int do_migration(struct conv_ftl *conv_ftl, bool force)
     ppa.g.blk = victim_line->id; // 선택된 라인 ID를 블록 주소로 설정
     // GC 정보 디버그 출력
     NVMEV_DEBUG_VERBOSE("GC-ing line:%d,ipc=%d(%d),victim=%d,full=%d,free=%d\n", ppa.g.blk,
-            victim_line->ipc, victim_line->vpc, conv_ftl->lm.victim_line_cnt,
-            conv_ftl->lm.full_line_cnt, conv_ftl->lm.free_line_cnt);
+            victim_line->ipc, victim_line->vpc, conv_ftl->slc_lm.victim_line_cnt,
+            conv_ftl->slc_lm.full_line_cnt, conv_ftl->slc_lm.free_line_cnt);
 
-    conv_ftl->slc_wfc.credits_to_refill = victim_line->ipc; // 회수된 공간만큼 크레딧 리필량 설정
+    conv_ftl->slc_wfc.credits_to_refill = spp->slc_pgs_per_line; // 회수된 공간만큼 크레딧 리필량 설정
 
     /* copy back valid data */
     // 모든 플래시 페이지를 순회하며 유효 데이터 이동
@@ -1214,7 +1287,7 @@ static int do_migration(struct conv_ftl *conv_ftl, bool force)
                             .interleave_pci_dma = false,
                             .ppa = &ppa,
                         };
-                        x(conv_ftl->ssd, &gce);
+                        ssd_advance_nand(conv_ftl->ssd, &gce);
                     }
 
                     lunp->gc_endtime = lunp->next_lun_avail_time; // 시간 갱신
@@ -1224,7 +1297,7 @@ static int do_migration(struct conv_ftl *conv_ftl, bool force)
     }
 
     /* update line status */
-    mark_line_free(conv_ftl, &ppa); // 라인을 프리 리스트로 복귀
+    mark_line_free(conv_ftl, &ppa, &conv_ftl->slc_lm); // 라인을 프리 리스트로 복귀
 
     return 0;
 }
@@ -1280,7 +1353,7 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
                             .interleave_pci_dma = false,
                             .ppa = &ppa,
                         };
-                        x(conv_ftl->ssd, &gce);
+                        ssd_advance_nand(conv_ftl->ssd, &gce);
                     }
 
                     lunp->gc_endtime = lunp->next_lun_avail_time; // 시간 갱신
@@ -1290,7 +1363,7 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
     }
 
     /* update line status */
-    mark_line_free(conv_ftl, &ppa); // 라인을 프리 리스트로 복귀
+    mark_line_free(conv_ftl, &ppa, &conv_ftl->tlc_lm); // 라인을 프리 리스트로 복귀
 
     return 0;
 }
@@ -1304,7 +1377,14 @@ static void foreground_gc(struct conv_ftl *conv_ftl)
         do_gc(conv_ftl, true); // 강제로 GC 수행
     }
 }
-
+// 전경(Foreground) GC 수행 함수 (쓰기 도중 공간 부족 시 호출)
+static void foreground_mg(struct conv_ftl *conv_ftl)
+{
+    if (should_mg_high(conv_ftl)) { // 긴급 임계값 체크
+        NVMEV_DEBUG_VERBOSE("should_mg high passed");
+        do_mg(conv_ftl, true); // 강제로 mg 수행
+    }
+}
 // 두 PPA가 동일한 플래시 페이지(물리적 위치)인지 확인하는 함수
 static bool is_same_flash_page(struct conv_ftl *conv_ftl, struct ppa ppa1, struct ppa ppa2)
 {
@@ -1535,7 +1615,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
         // (4) oneshot(wordline) 단위로 모아서 NAND program을 발행하는 모델:
         // - last_pg_in_wordline()이 true일 때만 실제 NAND_WRITE를 시뮬레이션한다.
         // - 즉, 매 LPN마다 바로 NAND에 쓰는 게 아니라, 내부적으로 "모아서" 쓰는 구조.
-        if (last_pg_in_wordline(conv_ftl, &ppa)) {
+        if (last_pg_in_wordline(conv_ftl, &ppa,USER_IO)) {
             // 이번 oneshot program을 대표하는 ppa를 swr에 넣는다
             swr.ppa = &ppa;
 
